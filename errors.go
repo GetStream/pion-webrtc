@@ -281,6 +281,7 @@ var (
 	errRTPTransceiverCodecUnsupported       = errors.New("unsupported codec type by this transceiver")
 
 	errSCTPTransportDTLS = errors.New("DTLS not established")
+	errSctpInitInvalid   = errors.New("invalid sctp-init")
 
 	errSDPZeroTransceivers                 = errors.New("addTransceiverSDP() called with 0 transceivers")
 	errSDPMediaSectionMediaDataChanInvalid = errors.New("invalid Media Section. Media + DataChannel both enabled")

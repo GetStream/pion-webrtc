@@ -182,6 +182,9 @@ func (d *DataChannel) open(sctpTransport *SCTPTransport) error { //nolint:cyclop
 
 		return err
 	}
+	if d.negotiated {
+		sctpTransport.negotiatedDataChannelOpened.Store(true)
+	}
 
 	// bufferedAmountLowThreshold and onBufferedAmountLow might be set earlier
 	dc.SetBufferedAmountLowThreshold(d.bufferedAmountLowThreshold)

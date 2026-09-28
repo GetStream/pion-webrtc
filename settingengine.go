@@ -696,7 +696,9 @@ func (e *SettingEngine) EnableSCTPZeroChecksum(isEnabled bool) {
 	e.sctp.enableZeroChecksum = isEnabled
 }
 
-// EnableSctpSnap enables the use of the SCTP SNAP connect optimization.
+// EnableSctpSnap enables the use of the SCTP SNAP connect optimization
+// (draft-hancke-tsvwg-snap). Like every setting, it is copied when the API is created,
+// so it stays fixed for the lifetime of each PeerConnection.
 func (e *SettingEngine) EnableSctpSnap(isEnabled bool) {
 	e.sctp.enableSnap = isEnabled
 }

@@ -3146,7 +3146,10 @@ func (pc *PeerConnection) startRTP(
 	if d := haveDataChannel(remoteDesc); d != nil {
 		// RFC 8843 Section 6 permits bundle-only media sections to use port zero.
 		if _, bundleOnly := d.Attribute("bundle-only"); d.MediaName.Port.Value != 0 || bundleOnly {
-			remoteSctpInit, _ := getSctpInit(d)
+			remoteSctpInit, err := getSctpInit(d)
+			if err != nil {
+				pc.log.Warnf("Ignoring remote sctp-init, using the SCTP handshake: %v", err)
+			}
 			pc.startSCTP(getMaxMessageSize(d), remoteSctpInit)
 		}
 	}
@@ -3340,7 +3343,8 @@ func (pc *PeerConnection) generateMatchedSDP(
 
 		if media.MediaName.Media == mediaSectionApplication {
 			init, _ := getSctpInit(media)
-			if init != nil && pc.api.settingEngine.sctp.enableSnap {
+			if init != nil && pc.api.settingEngine.sctp.enableSnap &&
+				sctpInitAllowed(pc.currentLocalDescription, pc.currentRemoteDescription) {
 				pc.sctpTransport.lock.Lock()
 				localSctpInit = pc.sctpTransport.GetSctpInit()
 				pc.sctpTransport.lock.Unlock()
