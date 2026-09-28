@@ -1277,6 +1277,25 @@ func getSctpInit(desc *sdp.MediaDescription) ([]byte, error) {
 	return nil, nil
 }
 
+// sctpInitAllowed reports whether our data section may carry sctp-init, given the current
+// local and remote descriptions. Before a data section has been negotiated it may. After
+// that it may only if both current descriptions carry a valid sctp-init, so sctp-init is
+// never added to an SCTP association that was started without it
+// (draft-hancke-tsvwg-snap Section 5.6). Our own value never changes.
+func sctpInitAllowed(currentLocal, currentRemote *SessionDescription) bool {
+	if currentLocal == nil || currentRemote == nil {
+		return true
+	}
+	local, remote := haveDataChannel(currentLocal), haveDataChannel(currentRemote)
+	if local == nil || remote == nil {
+		return true
+	}
+	localInit, _ := getSctpInit(local)
+	remoteInit, _ := getSctpInit(remote)
+
+	return localInit != nil && remoteInit != nil
+}
+
 // validateSctpInit checks that init is one SCTP INIT chunk (RFC 9260 Section 3.3.2) that
 // an SCTP stack accepts, with the checks pion/sctp applies to an INIT received on the
 // wire: nothing but up to 3 zero bytes of padding after the chunk, a non-zero Initiate

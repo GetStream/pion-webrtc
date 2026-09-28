@@ -3325,7 +3325,8 @@ func (pc *PeerConnection) generateMatchedSDP(
 
 		if media.MediaName.Media == mediaSectionApplication {
 			init, _ := getSctpInit(media)
-			if init != nil && pc.api.settingEngine.sctp.enableSnap {
+			if init != nil && pc.api.settingEngine.sctp.enableSnap &&
+				sctpInitAllowed(pc.currentLocalDescription, pc.currentRemoteDescription) {
 				pc.sctpTransport.lock.Lock()
 				localSctpInit = pc.sctpTransport.GetSctpInit()
 				pc.sctpTransport.lock.Unlock()

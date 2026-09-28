@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/pion/dtls/v4/pkg/crypto/prf"
 	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/logging"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/v5/test"
 	"github.com/pion/transport/v5/vnet"
 	"github.com/stretchr/testify/assert"
@@ -499,4 +501,193 @@ func TestPeerConnection_WARPState_DTLS13(t *testing.T) {
 	want := WARPState{DTLSVersion: protocol.Version1_3, SNAP: true, NegotiatedDataChannel: true}
 	assert.Equal(t, want, res.offerState)
 	assert.Equal(t, want, res.answerState)
+}
+
+// chromeSctpInit2 is the answer example of draft-hancke-tsvwg-snap.
+const chromeSctpInit2 = "AQAAHl+zdHQAUAAA/////6Gq3HTAAAAEgAgABoLA"
+
+// invalidSctpInit is Chrome's example with a zero Initiate Tag.
+const invalidSctpInit = "AQAAHgAAAAAAUAAA/////+B5ZR3AAAAEgAgABoLA"
+
+// chromeLikeDescription is a description with a data section as Chrome writes it, carrying
+// sctpInit unless it is empty.
+func chromeLikeDescription(sdpType SDPType, version int, sctpInit string) SessionDescription {
+	setup := sdp.ConnectionRoleActpass.String()
+	if sdpType == SDPTypeAnswer {
+		setup = sdp.ConnectionRoleActive.String()
+	}
+	desc := "v=0\r\n" +
+		"o=- 4611731400430051336 " + strconv.Itoa(version) + " IN IP4 127.0.0.1\r\n" +
+		"s=-\r\n" +
+		"t=0 0\r\n" +
+		"a=group:BUNDLE 0\r\n" +
+		"a=msid-semantic: WMS\r\n" +
+		"m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" +
+		"c=IN IP4 0.0.0.0\r\n" +
+		"a=ice-ufrag:rmtu\r\n" +
+		"a=ice-pwd:remotepasswordremotepassw\r\n" +
+		"a=ice-options:trickle\r\n" +
+		"a=fingerprint:sha-256 0F:74:31:25:CB:A2:13:EC:28:6F:6D:2C:61:FF:5D:C2:BC:B9:DB:3D:98:14:8D:1A:BB:EA:33:0C:A4:60:A8:8E\r\n" + //nolint:lll
+		"a=setup:" + setup + "\r\n" +
+		"a=mid:0\r\n" +
+		"a=sctp-port:5000\r\n" +
+		"a=max-message-size:262144\r\n"
+	if sctpInit != "" {
+		desc += "a=sctp-init:" + sctpInit + "\r\n"
+	}
+
+	return SessionDescription{Type: sdpType, SDP: desc}
+}
+
+func newSNAPTestPeerConnection(t *testing.T, snap bool) *PeerConnection {
+	t.Helper()
+
+	settings := SettingEngine{}
+	settings.EnableSctpSnap(snap)
+	settings.SetInterfaceFilter(func(string) bool { return false })
+	pc, err := NewAPI(WithSettingEngine(settings)).NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, pc.Close()) })
+
+	return pc
+}
+
+func sctpInitOf(t *testing.T, desc string) string {
+	t.Helper()
+
+	for line := range strings.SplitSeq(desc, "\r\n") {
+		if value, ok := strings.CutPrefix(line, "a=sctp-init:"); ok {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func setLocalDescriptionAndGather(t *testing.T, pc *PeerConnection, desc SessionDescription) {
+	t.Helper()
+
+	gathered := GatheringCompletePromise(pc)
+	require.NoError(t, pc.SetLocalDescription(desc))
+	<-gathered
+}
+
+// TestSctpSnap_RenegotiationKeepsFirstSctpInit answers Chrome-like offers and re-offers:
+// once a data section has been negotiated, the answers keep sctp-init as the first answer
+// had it. They never add it and never change it.
+func TestSctpSnap_RenegotiationKeepsFirstSctpInit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		snap   bool
+		offers []string // sctp-init of each offer, "" for none
+		want   []bool   // whether each answer carries our sctp-init
+	}{
+		{
+			name: "RepeatedByChrome", snap: true,
+			offers: []string{chromeSctpInit, chromeSctpInit, chromeSctpInit}, want: []bool{true, true, true},
+		},
+		{
+			name: "AddedInReOffer", snap: true,
+			offers: []string{"", chromeSctpInit}, want: []bool{false, false},
+		},
+		{
+			name: "ValidAfterInvalid", snap: true,
+			offers: []string{invalidSctpInit, chromeSctpInit}, want: []bool{false, false},
+		},
+		{
+			name: "ChangedInReOffer", snap: true,
+			offers: []string{chromeSctpInit, chromeSctpInit2}, want: []bool{true, true},
+		},
+		{
+			name: "DroppedThenRepeated", snap: true,
+			offers: []string{chromeSctpInit, "", chromeSctpInit}, want: []bool{true, false, false},
+		},
+		{
+			name: "SNAPDisabled", snap: false,
+			offers: []string{chromeSctpInit, chromeSctpInit}, want: []bool{false, false},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := newSNAPTestPeerConnection(t, tc.snap)
+
+			var first string
+			for i, sctpInit := range tc.offers {
+				require.NoError(t, pc.SetRemoteDescription(chromeLikeDescription(SDPTypeOffer, i+2, sctpInit)))
+				answer, err := pc.CreateAnswer(nil)
+				require.NoError(t, err)
+
+				got := sctpInitOf(t, answer.SDP)
+				assert.Equal(t, tc.want[i], got != "", "answer %d: %q", i+1, got)
+				if i == 0 {
+					first = got
+				} else if got != "" {
+					assert.Equal(t, first, got, "answer %d changed sctp-init", i+1)
+				}
+				setLocalDescriptionAndGather(t, pc, answer)
+			}
+		})
+	}
+}
+
+// TestSctpSnap_RenegotiationAsOfferer checks re-offers, and answers to the remote peer's
+// re-offers, after pion offered SNAP: sctp-init stays only if the first answer accepted it.
+func TestSctpSnap_RenegotiationAsOfferer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		answer      string // sctp-init of the remote answer
+		wantInitial bool
+	}{
+		{name: "Accepted", answer: chromeSctpInit, wantInitial: true},
+		{name: "NotAccepted", answer: ""},
+		{name: "InvalidAnswer", answer: invalidSctpInit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := newSNAPTestPeerConnection(t, true)
+			_, err := pc.CreateDataChannel("warp", nil)
+			require.NoError(t, err)
+
+			offer, err := pc.CreateOffer(nil)
+			require.NoError(t, err)
+			ours := sctpInitOf(t, offer.SDP)
+			require.NotEmpty(t, ours)
+			setLocalDescriptionAndGather(t, pc, offer)
+			require.NoError(t, pc.SetRemoteDescription(chromeLikeDescription(SDPTypeAnswer, 2, tc.answer)))
+
+			want := ""
+			if tc.wantInitial {
+				want = ours
+			}
+
+			reOffer, err := pc.CreateOffer(nil)
+			require.NoError(t, err)
+			assert.Equal(t, want, sctpInitOf(t, reOffer.SDP), "re-offer")
+			setLocalDescriptionAndGather(t, pc, reOffer)
+			require.NoError(t, pc.SetRemoteDescription(chromeLikeDescription(SDPTypeAnswer, 3, tc.answer)))
+
+			// Chrome keeps offering the sctp-init of its current description.
+			require.NoError(t, pc.SetRemoteDescription(chromeLikeDescription(SDPTypeOffer, 4, chromeSctpInit)))
+			answer, err := pc.CreateAnswer(nil)
+			require.NoError(t, err)
+			assert.Equal(t, want, sctpInitOf(t, answer.SDP), "answer to the remote re-offer")
+		})
+	}
+}
+
+// TestSctpSnap_EnabledOncePerPeerConnection checks that EnableSctpSnap cannot change after the
+// API is created.
+func TestSctpSnap_EnabledOncePerPeerConnection(t *testing.T) {
+	settings := SettingEngine{}
+	settings.EnableSctpSnap(true)
+	settings.SetInterfaceFilter(func(string) bool { return false })
+	api := NewAPI(WithSettingEngine(settings))
+	settings.EnableSctpSnap(false)
+
+	pc, err := api.NewPeerConnection(Configuration{})
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, pc.Close()) }()
+
+	require.NoError(t, pc.SetRemoteDescription(chromeLikeDescription(SDPTypeOffer, 2, chromeSctpInit)))
+	answer, err := pc.CreateAnswer(nil)
+	require.NoError(t, err)
+	assert.NotEmpty(t, sctpInitOf(t, answer.SDP))
 }
