@@ -11,6 +11,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"strings"
@@ -358,6 +359,22 @@ func runSNAPPair(t *testing.T, oneWayDelay time.Duration, cfg snapPairConfig) sn
 	}
 }
 
+// mungeSctpInit rewrites the INIT chunk in the sctp-init attribute of desc.
+func mungeSctpInit(t *testing.T, desc string, edit func([]byte)) string {
+	t.Helper()
+
+	const prefix = "a=sctp-init:"
+	start := strings.Index(desc, prefix)
+	require.GreaterOrEqual(t, start, 0, "no sctp-init")
+	start += len(prefix)
+	end := start + strings.Index(desc[start:], "\r\n")
+	init, err := base64.StdEncoding.DecodeString(desc[start:end])
+	require.NoError(t, err)
+	edit(init)
+
+	return desc[:start] + base64.StdEncoding.EncodeToString(init) + desc[end:]
+}
+
 // TestSctpSnap_Wire checks on the wire, in decrypted DTLS records, that a SNAP association
 // starts without the SCTP handshake and that a negotiated data channel opens without DCEP,
 // and that WARPState reports both.
@@ -398,6 +415,19 @@ func TestSctpSnap_Wire(t *testing.T) {
 		{
 			name:          "NoSNAP",
 			cfg:           snapPairConfig{negotiatedID: &negotiatedID},
+			wantHandshake: true,
+		},
+		{
+			// A valid base64 value that is not a valid INIT: the answerer leaves sctp-init out of
+			// its answer and both sides run the handshake.
+			name: "InvalidRemoteInit",
+			cfg: snapPairConfig{
+				offer: snapPeerConfig{snap: true}, answer: snapPeerConfig{snap: true},
+				negotiatedID: &negotiatedID,
+				mungeOffer: func(offer string) string {
+					return mungeSctpInit(t, offer, func(init []byte) { copy(init[4:8], []byte{0, 0, 0, 0}) })
+				},
+			},
 			wantHandshake: true,
 		},
 	} {

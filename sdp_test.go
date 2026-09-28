@@ -10,9 +10,13 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
+	"net"
 	"strings"
 	"testing"
 
+	"github.com/pion/logging"
+	"github.com/pion/sctp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
@@ -1717,26 +1721,173 @@ a=sendrecv
 	}
 }
 
+// chromeSctpInit is the sctp-init Chrome sends with default options, from
+// draft-hancke-tsvwg-snap: an unpadded 30-byte INIT chunk.
+const chromeSctpInit = "AQAAHols3R0AUAAA/////+B5ZR3AAAAEgAgABoLA"
+
+func sctpInitMedia(value string) *sdp.MediaDescription {
+	return &sdp.MediaDescription{Attributes: []sdp.Attribute{{Key: "sctp-init", Value: value}}}
+}
+
 func TestSctpInit(t *testing.T) {
-	t.Run("base64-encoded sctp-init is valid", func(t *testing.T) {
-		s := &sdp.SessionDescription{
-			MediaDescriptions: []*sdp.MediaDescription{
-				{Attributes: []sdp.Attribute{{Key: "sctp-init", Value: "Q29va2llTW9uc3Rlcg=="}}},
-			},
+	chrome, err := base64.StdEncoding.DecodeString(chromeSctpInit)
+	require.NoError(t, err)
+	edit := func(f func([]byte) []byte) string {
+		return base64.StdEncoding.EncodeToString(f(append([]byte{}, chrome...)))
+	}
+	pionToken, err := sctp.GenerateOutOfBandToken()
+	require.NoError(t, err)
+	pionZeroChecksumToken, err := sctp.GenerateOutOfBandToken(sctp.WithEnableZeroChecksum(true))
+	require.NoError(t, err)
+
+	t.Run("Valid", func(t *testing.T) {
+		for name, value := range map[string]string{
+			"Chrome":             chromeSctpInit,
+			"Chrome padded":      edit(func(b []byte) []byte { return append(b, 0, 0) }),
+			"pion":               base64.StdEncoding.EncodeToString(pionToken),
+			"pion zero checksum": base64.StdEncoding.EncodeToString(pionZeroChecksumToken),
+			"unknown skipped parameter": edit(func(b []byte) []byte {
+				b = append(b, 0, 0, 0x81, 0x23, 0, 5, 1, 0, 0, 0)   // pad the last parameter, then add one
+				binary.BigEndian.PutUint16(b[2:], uint16(len(b)-3)) //nolint:gosec // G115, a few dozen bytes
+
+				return b[:len(b)-3]
+			}),
+		} {
+			t.Run(name, func(t *testing.T) {
+				init, err := getSctpInit(sctpInitMedia(value))
+				require.NoError(t, err)
+				want, err := base64.StdEncoding.DecodeString(value)
+				require.NoError(t, err)
+				assert.Equal(t, want, init)
+
+				// Whatever getSctpInit accepts, pion/sctp can start an association from.
+				local, remote := net.Pipe()
+				defer func() { assert.NoError(t, remote.Close()) }()
+				association, err := sctp.ClientWithOptions(
+					sctp.WithNetConn(local),
+					sctp.WithSNAP(pionToken, init),
+					sctp.WithLoggerFactory(logging.NewDefaultLoggerFactory()),
+				)
+				require.NoError(t, err)
+				assert.NoError(t, association.Close())
+			})
 		}
-		init, err := getSctpInit(s.MediaDescriptions[0])
-		assert.NoError(t, err)
-		assert.Equal(t, init, []uint8("CookieMonster"))
 	})
-	t.Run("Not base64-encoded sctp-init is rejected", func(t *testing.T) {
-		s := &sdp.SessionDescription{
-			MediaDescriptions: []*sdp.MediaDescription{
-				{Attributes: []sdp.Attribute{{Key: "sctp-init", Value: "*"}}},
-			},
-		}
-		_, err := getSctpInit(s.MediaDescriptions[0])
+
+	t.Run("NotBase64", func(t *testing.T) {
+		_, err := getSctpInit(sctpInitMedia("*"))
 		var corruptInputError base64.CorruptInputError
 		assert.ErrorAs(t, err, &corruptInputError)
+	})
+
+	t.Run("Invalid", func(t *testing.T) {
+		for name, value := range map[string]string{
+			"base64 length": chromeSctpInit[:20] + "\n" + chromeSctpInit[20:],
+			"INIT ACK": edit(func(b []byte) []byte {
+				b[0] = 2
+
+				return b
+			}),
+			"flags": edit(func(b []byte) []byte {
+				b[1] = 1
+
+				return b
+			}),
+			"too short": edit(func(b []byte) []byte { return b[:19] }),
+			"chunk length beyond the data": edit(func(b []byte) []byte {
+				binary.BigEndian.PutUint16(b[2:], 31)
+
+				return b
+			}),
+			"chunk length below 20": edit(func(b []byte) []byte {
+				binary.BigEndian.PutUint16(b[2:], 16)
+
+				return b[:16]
+			}),
+			"second chunk":     edit(func(b []byte) []byte { return append(b, 0, 0, 11, 0, 0, 4) }),
+			"non-zero padding": edit(func(b []byte) []byte { return append(b, 0, 1) }),
+			"zero Initiate Tag": edit(func(b []byte) []byte {
+				copy(b[4:], []byte{0, 0, 0, 0})
+
+				return b
+			}),
+			"a_rwnd below 1500": edit(func(b []byte) []byte {
+				binary.BigEndian.PutUint32(b[8:], 1499)
+
+				return b
+			}),
+			"zero outbound streams": edit(func(b []byte) []byte {
+				b[12], b[13] = 0, 0
+
+				return b
+			}),
+			"zero inbound streams": edit(func(b []byte) []byte {
+				b[14], b[15] = 0, 0
+
+				return b
+			}),
+			"truncated parameter": edit(func(b []byte) []byte {
+				b = append(b, 0, 0, 0x80, 0x01)
+				binary.BigEndian.PutUint16(b[2:], uint16(len(b))) //nolint:gosec // G115, a few dozen bytes
+
+				return b
+			}),
+			"parameter length beyond the chunk": edit(func(b []byte) []byte {
+				binary.BigEndian.PutUint16(b[26:], 7)
+
+				return b
+			}),
+			"parameter length below 4": edit(func(b []byte) []byte {
+				binary.BigEndian.PutUint16(b[22:], 2)
+
+				return b
+			}),
+			"parameter that stops processing": edit(func(b []byte) []byte {
+				b = append(b, 0, 0, 0, 5, 0, 8, 192, 0, 2, 1)     // IPv4 address
+				binary.BigEndian.PutUint16(b[2:], uint16(len(b))) //nolint:gosec // G115, a few dozen bytes
+
+				return b
+			}),
+		} {
+			t.Run(name, func(t *testing.T) {
+				init, err := getSctpInit(sctpInitMedia(value))
+				assert.ErrorIs(t, err, errSctpInitInvalid)
+				assert.Nil(t, init)
+			})
+		}
+	})
+
+	t.Run("Absent", func(t *testing.T) {
+		init, err := getSctpInit(&sdp.MediaDescription{})
+		assert.NoError(t, err)
+		assert.Nil(t, init)
+	})
+}
+
+// FuzzValidateSctpInit checks that validateSctpInit never panics and that pion/sctp can
+// start an association from every INIT it accepts.
+func FuzzValidateSctpInit(f *testing.F) {
+	chrome, err := base64.StdEncoding.DecodeString(chromeSctpInit)
+	require.NoError(f, err)
+	pionToken, err := sctp.GenerateOutOfBandToken(sctp.WithEnableZeroChecksum(true))
+	require.NoError(f, err)
+	f.Add(chrome)
+	f.Add(pionToken)
+	f.Add(append(append([]byte{}, chrome...), 0, 0))
+
+	f.Fuzz(func(t *testing.T, init []byte) {
+		if validateSctpInit(init) != nil {
+			return
+		}
+		local, remote := net.Pipe()
+		defer func() { assert.NoError(t, remote.Close()) }()
+		association, err := sctp.ClientWithOptions(
+			sctp.WithNetConn(local),
+			sctp.WithSNAP(pionToken, init),
+			sctp.WithLoggerFactory(logging.NewDefaultLoggerFactory()),
+		)
+		require.NoError(t, err)
+		assert.NoError(t, association.Close())
 	})
 }
 

@@ -3128,7 +3128,10 @@ func (pc *PeerConnection) startRTP(
 	if d := haveDataChannel(remoteDesc); d != nil {
 		// RFC 8843 Section 6 permits bundle-only media sections to use port zero.
 		if _, bundleOnly := d.Attribute("bundle-only"); d.MediaName.Port.Value != 0 || bundleOnly {
-			remoteSctpInit, _ := getSctpInit(d)
+			remoteSctpInit, err := getSctpInit(d)
+			if err != nil {
+				pc.log.Warnf("Ignoring remote sctp-init, using the SCTP handshake: %v", err)
+			}
 			pc.startSCTP(getMaxMessageSize(d), remoteSctpInit)
 		}
 	}

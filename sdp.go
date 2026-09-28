@@ -7,6 +7,7 @@ package webrtc
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/url"
@@ -1252,11 +1253,20 @@ func getMaxMessageSize(desc *sdp.MediaDescription) uint32 {
 	return 0
 }
 
+// getSctpInit returns the SCTP INIT chunk in the sctp-init attribute of a data section,
+// or nil if there is none. It returns an error if the attribute is not padded base64 of
+// exactly one valid INIT chunk; the caller must then run the SCTP handshake instead.
 func getSctpInit(desc *sdp.MediaDescription) ([]byte, error) {
 	for _, a := range desc.Attributes {
 		if strings.TrimSpace(a.Key) == "sctp-init" {
 			decoded, err := base64.StdEncoding.DecodeString(a.Value)
 			if err != nil {
+				return nil, err
+			}
+			if len(a.Value)%4 != 0 {
+				return nil, fmt.Errorf("%w: base64 length %d", errSctpInitInvalid, len(a.Value))
+			}
+			if err = validateSctpInit(decoded); err != nil {
 				return nil, err
 			}
 
@@ -1265,4 +1275,49 @@ func getSctpInit(desc *sdp.MediaDescription) ([]byte, error) {
 	}
 
 	return nil, nil
+}
+
+// validateSctpInit checks that init is one SCTP INIT chunk (RFC 9260 Section 3.3.2) that
+// an SCTP stack accepts, with the checks pion/sctp applies to an INIT received on the
+// wire: nothing but up to 3 zero bytes of padding after the chunk, a non-zero Initiate
+// Tag and stream counts, an a_rwnd of at least 1500, well-formed parameters and no
+// parameter whose type tells the receiver to stop processing the chunk.
+func validateSctpInit(init []byte) error { //nolint:cyclop
+	const (
+		chunkTypeInit     = 1
+		initLength        = 20 // chunk header and fixed fields
+		paramHeaderLength = 4
+		minAdvertisedRWND = 1500
+	)
+	if len(init) < initLength || init[0] != chunkTypeInit || init[1] != 0 {
+		return fmt.Errorf("%w: not an INIT chunk", errSctpInitInvalid)
+	}
+	length := int(binary.BigEndian.Uint16(init[2:]))
+	if length < initLength || length > len(init) || len(init)-length > 3 ||
+		slices.ContainsFunc(init[length:], func(b byte) bool { return b != 0 }) {
+		return fmt.Errorf("%w: chunk length %d in %d bytes", errSctpInitInvalid, length, len(init))
+	}
+	if binary.BigEndian.Uint32(init[4:]) == 0 || binary.BigEndian.Uint32(init[8:]) < minAdvertisedRWND ||
+		binary.BigEndian.Uint16(init[12:]) == 0 || binary.BigEndian.Uint16(init[14:]) == 0 {
+		return fmt.Errorf("%w: zero tag or streams, or a_rwnd below %d", errSctpInitInvalid, minAdvertisedRWND)
+	}
+	for params := init[initLength:length]; len(params) > 0; {
+		if len(params) < paramHeaderLength {
+			return fmt.Errorf("%w: truncated parameter", errSctpInitInvalid)
+		}
+		paramType := binary.BigEndian.Uint16(params)
+		paramLength := int(binary.BigEndian.Uint16(params[2:]))
+		if paramLength < paramHeaderLength || paramLength > len(params) {
+			return fmt.Errorf("%w: parameter length %d", errSctpInitInvalid, paramLength)
+		}
+		// Parameter types with the high bit clear stop the processing of the chunk when not
+		// recognized (RFC 9260 Section 3.2.1). None of them belongs in a WebRTC INIT.
+		if paramType&0x8000 == 0 {
+			return fmt.Errorf("%w: parameter type %#04x", errSctpInitInvalid, paramType)
+		}
+		// Every parameter but the last is padded to 4 bytes.
+		params = params[min((paramLength+3)&^3, len(params)):]
+	}
+
+	return nil
 }
