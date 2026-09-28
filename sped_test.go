@@ -520,9 +520,9 @@ func TestSPED_SDP(t *testing.T) {
 	}
 
 	t.Run("Offer", func(t *testing.T) {
-		assert.Equal(t, []string{"sped", "googspedv1"}, iceOptions(t, offerSDP(t, true, nil)))
+		assert.Equal(t, []string{"sped", "googspedv1", "goog-sped-v1"}, iceOptions(t, offerSDP(t, true, nil)))
 		assert.Equal(t,
-			[]string{"trickle", "sped", "googspedv1"},
+			[]string{"trickle", "sped", "googspedv1", "goog-sped-v1"},
 			iceOptions(t, offerSDP(t, true, &OfferOptions{OfferAnswerOptions: OfferAnswerOptions{ICETricklingSupported: true}})),
 		)
 		assert.Empty(t, iceOptions(t, offerSDP(t, false, nil)))

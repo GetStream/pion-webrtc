@@ -797,7 +797,7 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 			descr.WithICETrickleAdvertised()
 		}
 		if pc.api.settingEngine.sped.enabled {
-			addSPEDICEOptions(descr, spedICEOptionList[:2])
+			addSPEDICEOptions(descr, spedICEOptionList)
 		}
 		if pc.api.settingEngine.renomination.enabled {
 			descr.WithICERenomination()

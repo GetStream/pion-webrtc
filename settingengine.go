@@ -592,8 +592,9 @@ func (e *SettingEngine) SetDTLSInsecureSkipHelloVerify(skip bool) {
 // EnableSped enables SPED (STUN Protocol for Embedding DTLS, draft-hancke-webrtc-sped):
 // the DTLS handshake rides the ICE connectivity checks, which saves one round trip.
 //
-// An offer carries the "sped" and "googspedv1" ICE options, and SPED is used if the
-// answer carries one of them. An answer carries the SPED ICE options of the offer
+// An offer carries the "sped", "googspedv1" and "goog-sped-v1" ICE options, so that
+// libwebrtc answerers from M149 on use SPED, and SPED is used if the answer carries one
+// of them. An answer carries the SPED ICE options of the offer
 // ("sped", "googspedv1" or "goog-sped-v1"), and SPED is used if there is one. Either
 // peer can still turn it off in band, and the handshake then runs after ICE connects.
 //
