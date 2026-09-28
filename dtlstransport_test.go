@@ -8,6 +8,9 @@ package webrtc
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -25,6 +28,7 @@ import (
 	"github.com/pion/srtp/v3"
 	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // An invalid fingerprint MUST cause DTLSTransport to go to failed state.
@@ -576,4 +580,34 @@ func TestSRTPProtectionProfileFromDTLS(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// Stop holds the transport lock while it closes the DTLS connection, and closing
+// waits for a running handshake. The handshake's certificate check must
+// therefore finish without that lock, or Stop deadlocks mid-handshake.
+func TestDTLSTransport_VerifyPeerCertificateWithoutTransportLock(t *testing.T) {
+	lim := test.TimeOut(5 * time.Second)
+	defer lim.Stop()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	certificate, err := GenerateCertificate(key)
+	require.NoError(t, err)
+	fingerprints, err := certificate.GetFingerprints()
+	require.NoError(t, err)
+	raw := certificate.x509Cert.Raw
+
+	transport := &DTLSTransport{api: NewAPI(), remoteParameters: DTLSParameters{Fingerprints: fingerprints}}
+	transport.lock.Lock()
+	defer transport.lock.Unlock()
+
+	verified := make(chan error, 1)
+	go func() { verified <- transport.verifyPeerCertificateFunc()([][]byte{raw}, nil) }()
+	select {
+	case err := <-verified:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "certificate verification waited for the transport lock")
+	}
+	assert.Equal(t, raw, transport.GetRemoteCertificate())
 }

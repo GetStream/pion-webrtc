@@ -40,9 +40,12 @@ import (
 type DTLSTransport struct {
 	lock sync.RWMutex
 
-	iceTransport          *ICETransport
-	certificates          []Certificate
-	remoteParameters      DTLSParameters
+	iceTransport     *ICETransport
+	certificates     []Certificate
+	remoteParameters DTLSParameters
+	// remoteCertificateLock guards remoteCertificate instead of lock: the DTLS
+	// handshake stores it while Stop may hold lock and wait for that handshake.
+	remoteCertificateLock sync.RWMutex
 	remoteCertificate     []byte
 	state                 DTLSTransportState
 	srtpProtectionProfile srtp.ProtectionProfile
@@ -214,8 +217,8 @@ func (t *DTLSTransport) NegotiatedVersion() (protocol.Version, bool) {
 // GetRemoteCertificate returns the certificate chain in use by the remote side
 // returns an empty list prior to selection of the remote certificate.
 func (t *DTLSTransport) GetRemoteCertificate() []byte {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
+	t.remoteCertificateLock.RLock()
+	defer t.remoteCertificateLock.RUnlock()
 
 	return t.remoteCertificate
 }
@@ -645,15 +648,16 @@ func (t *DTLSTransport) verifyPeerCertificateFunc() func([][]byte, [][]*x509.Cer
 			return errNoRemoteCertificate
 		}
 
-		t.lock.Lock()
-		defer t.lock.Unlock()
+		t.remoteCertificateLock.Lock()
 		t.remoteCertificate = rawCerts[0]
+		t.remoteCertificateLock.Unlock()
 
 		if t.api.settingEngine.disableCertificateFingerprintVerification {
 			return nil
 		}
 
-		parsedRemoteCert, err := x509.ParseCertificate(t.remoteCertificate)
+		// remoteParameters is set by Start before the handshake begins.
+		parsedRemoteCert, err := x509.ParseCertificate(rawCerts[0])
 		if err != nil {
 			return err
 		}
