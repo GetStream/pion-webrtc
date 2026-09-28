@@ -1,0 +1,48 @@
+# offer
+v=0
+o=MASKED
+s=-
+t=0 0
+a=msid-semantic:WMS *
+a=fingerprint:sha-256 MASKED
+a=extmap-allow-mixed
+a=group:BUNDLE 0
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=setup:actpass
+a=mid:0
+a=sendrecv
+a=sctp-port:5000
+a=max-message-size:1073741823
+a=ice-ufrag:offerufrag
+a=ice-pwd:offerufragpassword0123456789
+a=candidate:422338508 1 udp 2130706431 1.2.3.4 5000 typ host ufrag offerufrag generation 0
+a=candidate:422338508 2 udp 2130706431 1.2.3.4 5000 typ host ufrag offerufrag generation 0
+a=end-of-candidates
+# answer
+v=0
+o=MASKED
+s=-
+t=0 0
+a=msid-semantic:WMS *
+a=fingerprint:sha-256 MASKED
+a=ice-lite
+a=extmap-allow-mixed
+a=group:BUNDLE 0
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 0.0.0.0
+a=setup:active
+a=mid:0
+a=sendrecv
+a=sctp-port:5000
+a=max-message-size:1073741823
+a=ice-ufrag:answerufrag
+a=ice-pwd:answerufragpassword0123456789
+a=candidate:608990844 1 udp 2130706431 1.2.3.5 5001 typ host ufrag answerufrag generation 0
+a=candidate:608990844 2 udp 2130706431 1.2.3.5 5001 typ host ufrag answerufrag generation 0
+a=end-of-candidates
+# STUN from 1.2.3.4
+000100502112a44200000000000000000000000000060016616e7377657275667261673a6f6666657275667261670000802a00080000000000000000002400047effffff0008001400000000000000000000000000000000000000008028000400000000
+000100542112a44200000000000000000000000000060016616e7377657275667261673a6f666665727566726167000000250000802a00080000000000000000002400047effffff0008001400000000000000000000000000000000000000008028000400000000
+# STUN from 1.2.3.5
+0101002c2112a442000000000000000000000000002000080001329a2010a7460008001400000000000000000000000000000000000000008028000400000000
