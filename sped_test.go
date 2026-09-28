@@ -209,7 +209,7 @@ func (e *spedEnd) times() (iceConnected, dtlsConnected time.Time) {
 }
 
 func (e *spedEnd) spedState() ice.SPEDState {
-	return e.pc.iceTransport.SPEDState()
+	return e.pc.WARPState().SPED
 }
 
 // spedPair is an offerer and an answerer on a vnet whose router delays every
