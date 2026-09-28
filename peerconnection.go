@@ -796,6 +796,9 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 		if options != nil && options.ICETricklingSupported {
 			descr.WithICETrickleAdvertised()
 		}
+		if pc.api.settingEngine.sped.enabled {
+			addSPEDICEOptions(descr, spedICEOptionList[:2])
+		}
 		if pc.api.settingEngine.renomination.enabled {
 			descr.WithICERenomination()
 		}
@@ -940,7 +943,11 @@ func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescripti
 		return SessionDescription{}, &rtcerr.InvalidStateError{Err: ErrIncorrectSignalingState}
 	}
 
-	connectionRole := connectionRoleFromDtlsRole(pc.api.settingEngine.answeringDTLSRole)
+	var spedOptions []string
+	if pc.api.settingEngine.sped.enabled {
+		spedOptions = spedICEOptions(remoteDesc.parsed)
+	}
+	connectionRole := connectionRoleFromDtlsRole(pc.api.settingEngine.answeringRole(len(spedOptions) > 0))
 	if connectionRole == sdp.ConnectionRole(0) {
 		dtlsRole := dtlsRoleFromSDP(remoteDesc.parsed)
 		switch dtlsRole {
@@ -994,6 +1001,7 @@ func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescripti
 	if options != nil && options.ICETricklingSupported {
 		descr.WithICETrickleAdvertised()
 	}
+	addSPEDICEOptions(descr, spedOptions)
 	if pc.api.settingEngine.renomination.enabled {
 		descr.WithICERenomination()
 	}
@@ -1446,11 +1454,15 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		pc.configureRTPReceivers(false, &desc, currentTransceivers)
 	}
 
+	// Both descriptions carry a SPED ICE option: the answer echoes those of the offer.
+	sped := pc.api.settingEngine.sped.enabled && len(spedICEOptions(desc.parsed)) > 0
+
 	pc.ops.Enqueue(func() {
 		pc.startTransports(
 			iceRole,
 			dtlsRoleFromSDP(desc.parsed),
 			remoteIsLite,
+			sped,
 			iceDetails.Ufrag,
 			iceDetails.Password,
 			fingerprint,
@@ -3064,27 +3076,11 @@ func (pc *PeerConnection) GetStats() StatsReport {
 func (pc *PeerConnection) startTransports(
 	iceRole ICERole,
 	dtlsRole DTLSRole,
-	remoteIsLite bool,
+	remoteIsLite, sped bool,
 	remoteUfrag, remotePwd, fingerprint, fingerprintHash string,
 	localCryptexMode srtp.CryptexMode,
 	remoteCryptexMode srtp.CryptexMode,
 ) {
-	// Start the ice transport
-	err := pc.iceTransport.Start(
-		pc.iceGatherer,
-		ICEParameters{
-			UsernameFragment: remoteUfrag,
-			Password:         remotePwd,
-			ICELite:          remoteIsLite,
-		},
-		&iceRole,
-	)
-	if err != nil {
-		pc.log.Warnf("Failed to start manager: %s", err)
-
-		return
-	}
-
 	pc.dtlsTransport.internalOnCloseHandler = func() {
 		if pc.isClosed.Load() || pc.api.settingEngine.disableCloseByDTLS {
 			return
@@ -3101,11 +3097,33 @@ func (pc *PeerConnection) startTransports(
 	pc.dtlsTransport.setLocalCryptexMode(localCryptexMode)
 	pc.dtlsTransport.setRemoteCryptexMode(remoteCryptexMode)
 
-	// Start the dtls transport
-	err = pc.dtlsTransport.Start(DTLSParameters{
+	iceParameters := ICEParameters{
+		UsernameFragment: remoteUfrag,
+		Password:         remotePwd,
+		ICELite:          remoteIsLite,
+	}
+	dtlsParameters := DTLSParameters{
 		Role:         dtlsRole,
 		Fingerprints: []DTLSFingerprint{{Algorithm: fingerprintHash, Value: fingerprint}},
-	})
+	}
+
+	var err error
+	if sped {
+		// DTLS starts first, so that the connectivity checks carry its first flight.
+		err = pc.dtlsTransport.startWithSPED(dtlsParameters, iceRole, func() error {
+			return pc.iceTransport.Start(pc.iceGatherer, iceParameters, &iceRole)
+		})
+	} else {
+		// Start the ice transport
+		if err = pc.iceTransport.Start(pc.iceGatherer, iceParameters, &iceRole); err != nil {
+			pc.log.Warnf("Failed to start manager: %s", err)
+
+			return
+		}
+
+		// Start the dtls transport
+		err = pc.dtlsTransport.Start(dtlsParameters)
+	}
 	pc.updateConnectionState(pc.ICEConnectionState(), pc.dtlsTransport.State())
 	if err != nil {
 		pc.log.Warnf("Failed to start manager: %s", err)

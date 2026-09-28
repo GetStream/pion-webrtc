@@ -97,6 +97,10 @@ type SettingEngine struct {
 		cwndCAStep           uint32
 		enableSnap           bool
 	}
+	sped struct {
+		enabled           bool
+		answeringDTLSRole DTLSRole
+	}
 	sdpMediaLevelFingerprints                 bool
 	answeringDTLSRole                         DTLSRole
 	disableCertificateFingerprintVerification bool
@@ -418,6 +422,32 @@ func (e *SettingEngine) SetAnsweringDTLSRole(role DTLSRole) error {
 	return nil
 }
 
+// SetAnsweringDTLSRoleWithSPED sets the DTLS role of an answer to an offer that
+// negotiates SPED (see EnableSped), in place of SetAnsweringDTLSRole. An
+// answerer that is the DTLS server (DTLSRoleServer, a=setup:passive) receives
+// the offerer's ClientHello in its first connectivity check, and so saves a
+// round trip. Answers to offers without SPED keep the role SetAnsweringDTLSRole
+// selects, since a passive answer costs a peer without SPED half a round trip.
+func (e *SettingEngine) SetAnsweringDTLSRoleWithSPED(role DTLSRole) error {
+	if role != DTLSRoleClient && role != DTLSRoleServer {
+		return errSettingEngineSetAnsweringDTLSRole
+	}
+
+	e.sped.answeringDTLSRole = role
+
+	return nil
+}
+
+// answeringRole returns the DTLS role configured for an answer, which depends on
+// whether the offer negotiates SPED.
+func (e *SettingEngine) answeringRole(sped bool) DTLSRole {
+	if sped && e.sped.answeringDTLSRole != DTLSRoleUnknown {
+		return e.sped.answeringDTLSRole
+	}
+
+	return e.answeringDTLSRole
+}
+
 // SetNet sets the Net instance that is passed to pion/ice
 //
 // Net is an network interface layer for Pion, allowing users to replace
@@ -557,6 +587,23 @@ func (e *SettingEngine) SetDTLSRetransmissionInterval(interval time.Duration) {
 // but will have lower DoS attack resistance.
 func (e *SettingEngine) SetDTLSInsecureSkipHelloVerify(skip bool) {
 	e.dtls.insecureSkipHelloVerify = skip
+}
+
+// EnableSped enables SPED (STUN Protocol for Embedding DTLS, draft-hancke-webrtc-sped):
+// the DTLS handshake rides the ICE connectivity checks, which saves one round trip.
+//
+// An offer carries the "sped" and "googspedv1" ICE options, and SPED is used if the
+// answer carries one of them. An answer carries the SPED ICE options of the offer
+// ("sped", "googspedv1" or "goog-sped-v1"), and SPED is used if there is one. Either
+// peer can still turn it off in band, and the handshake then runs after ICE connects.
+//
+// While SPED is used, DTLS starts with the connectivity checks, uses a 900-byte MTU,
+// skips HelloVerifyRequest and the cookie HelloRetryRequest as a server, and does not
+// retransmit until ICE connects, then after about twice the ICE round-trip time.
+// Without SPED nothing changes. SetAnsweringDTLSRoleWithSPED sets the DTLS role of
+// answers to offers with SPED.
+func (e *SettingEngine) EnableSped(enable bool) {
+	e.sped.enabled = enable
 }
 
 // SetDTLSVersionRange sets the lowest and highest DTLS versions offered and accepted.

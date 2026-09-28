@@ -54,6 +54,14 @@ type ICETransport struct {
 	pendingPackets [][]byte
 	readLoopDone   chan struct{}
 
+	// spedAgent is the agent SPED is enabled on, or nil. See enableSPED.
+	spedAgent       atomic.Pointer[ice.Agent]
+	spedOnConnected func()
+	spedConnected   sync.Once
+	// dtlsBytesSent counts the DTLS datagrams written with ice.Agent.WriteDTLS,
+	// which ice.Conn.BytesSent does not count.
+	dtlsBytesSent atomic.Uint64
+
 	ctxCancel func()
 
 	loggerFactory logging.LoggerFactory
@@ -140,11 +148,15 @@ func (t *ICETransport) StartContext(
 		return fmt.Errorf("%w: unable to start ICETransport", errICEAgentNotExist)
 	}
 
+	spedOnConnected := t.spedOnConnected
 	if err := agent.OnConnectionStateChange(func(iceState ice.ConnectionState) {
 		state := newICETransportStateFromICE(iceState)
 
 		t.setState(state)
 		t.onConnectionStateChange(state)
+		if iceState == ice.ConnectionStateConnected && spedOnConnected != nil {
+			t.spedConnected.Do(spedOnConnected)
+		}
 	}); err != nil {
 		return err
 	}
@@ -181,17 +193,17 @@ func (t *ICETransport) StartContext(
 	var err error
 	switch *role {
 	case ICERoleControlling:
-		iceConn, err = agent.Dial(operationCtx,
-			params.UsernameFragment,
-			params.Password)
+		iceConn, err = agent.StartDial(params.UsernameFragment, params.Password)
 
 	case ICERoleControlled:
-		iceConn, err = agent.Accept(operationCtx,
-			params.UsernameFragment,
-			params.Password)
+		iceConn, err = agent.StartAccept(params.UsernameFragment, params.Password)
 
 	default:
 		err = errICERoleUnknown
+	}
+	// With SPED, DTLS runs during the connectivity checks, so do not wait for them.
+	if err == nil && t.spedAgent.Load() == nil {
+		err = agent.AwaitConnect(operationCtx)
 	}
 
 	// Reacquire the lock to set the connection and start WebRTC packet dispatch.
@@ -514,6 +526,8 @@ func (t *ICETransport) dispatchPacket(packet []byte) {
 		return
 	}
 
+	t.reportToSPED(packet)
+
 	t.packetLock.Lock()
 	var handler func([]byte) error
 	switch {
@@ -608,6 +622,127 @@ func (t *ICETransport) write(packet []byte) (int, error) {
 	return n, err
 }
 
+// enableSPED enables SPED (DTLS in STUN) on the ICE agent. It must be called
+// before Start, with the role Start will get, which the DTLS role depends on:
+// the agent then carries SPED attributes from its first check, and Start
+// returns without waiting for the checks. DTLS datagrams embedded in STUN go
+// to the DTLS handler, and onConnected runs once, when ICE first connects.
+func (t *ICETransport) enableSPED(role ICERole, onConnected func()) error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if err := t.ensureGatherer(); err != nil {
+		return err
+	}
+	agent := t.gatherer.getAgent()
+	if agent == nil {
+		return fmt.Errorf("%w: unable to enable SPED", errICEAgentNotExist)
+	}
+	if err := agent.EnableSPED(); err != nil {
+		return err
+	}
+	agent.SetDTLSCallback(t.handleEmbeddedDTLS)
+	t.role = role
+	t.spedOnConnected = onConnected
+	t.spedAgent.Store(agent)
+
+	return nil
+}
+
+// reportToSPED reports a DTLS datagram received directly, which SPED acknowledges,
+// and SRTP or SRTCP, which completes SPED once the local handshake is complete.
+func (t *ICETransport) reportToSPED(packet []byte) {
+	agent := t.spedAgent.Load()
+	switch {
+	case agent == nil:
+	case matchDTLS(packet):
+		agent.ReportDTLSPacket(packet)
+	case matchRange(128, 191, packet):
+		agent.ApplicationDataReceived()
+	}
+}
+
+// SPEDState returns the state of SPED (DTLS in STUN) on this transport:
+// ice.SPEDStateDisabled when it was not negotiated, ice.SPEDStateOff when the
+// peer did not use it, and ice.SPEDStateComplete once the DTLS handshake
+// completed through it.
+func (t *ICETransport) SPEDState() ice.SPEDState {
+	if agent := t.spedAgent.Load(); agent != nil {
+		return agent.SPEDState()
+	}
+
+	return ice.SPEDStateDisabled
+}
+
+// handleEmbeddedDTLS runs on the ICE agent's loop for each DTLS datagram
+// embedded in STUN, before the Binding response is built. The DTLS handler
+// processes it synchronously, so a flight it produces rides the response.
+func (t *ICETransport) handleEmbeddedDTLS(packet []byte, _ net.Addr) {
+	t.packetLock.Lock()
+	handler := t.dtlsHandler
+	t.packetLock.Unlock()
+
+	if handler != nil {
+		t.handlePacket(handler, packet)
+	}
+}
+
+// writeDTLSFlight sends a batch of datagrams DTLS produced while SPED is
+// enabled: in STUN while SPED is active, and directly as soon as a pair is
+// usable, as libwebrtc does. It never waits for the ICE agent's loop, so it
+// may run from handleEmbeddedDTLS.
+func (t *ICETransport) writeDTLSFlight(flight [][]byte) error {
+	agent := t.spedAgent.Load()
+	if agent.Piggyback(flight) {
+		switch agent.SPEDState() { //nolint:exhaustive
+		case ice.SPEDStateTentative, ice.SPEDStateConfirmed, ice.SPEDStatePending:
+		default:
+			// The agent holds the flight and sends it on the pair ICE selects.
+			return nil
+		}
+		for _, datagram := range flight {
+			_, _ = t.writeDTLS(datagram)
+		}
+
+		return nil
+	}
+
+	for _, datagram := range flight {
+		if _, err := t.writeDTLS(datagram); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeDTLS writes one DTLS datagram directly while SPED is enabled, on the
+// selected pair or, before ICE selects one, on a pair SPED found usable. It
+// never waits for the ICE agent's loop.
+func (t *ICETransport) writeDTLS(datagram []byte) (int, error) {
+	n, err := t.spedAgent.Load().WriteDTLS(datagram)
+	switch {
+	case errors.Is(err, ice.ErrNoCandidatePairs):
+		return 0, nil
+	case errors.Is(err, ice.ErrClosed):
+		return 0, io.ErrClosedPipe
+	}
+	t.dtlsBytesSent.Add(uint64(n)) //nolint:gosec // G115, n is never negative
+
+	return n, err
+}
+
+// selectedPairRTT returns the round-trip time ICE measured on the selected
+// pair, and false when there is no measurement.
+func (t *ICETransport) selectedPairRTT() (time.Duration, bool) {
+	stats, ok := t.GetSelectedCandidatePairStats()
+	if !ok || stats.ResponsesReceived == 0 {
+		return 0, false
+	}
+
+	return time.Duration(stats.CurrentRoundTripTime * float64(time.Second)), true
+}
+
 func (t *ICETransport) localAddr() net.Addr {
 	conn := t.getConn()
 	if conn == nil {
@@ -677,6 +812,7 @@ func (t *ICETransport) Stats() TransportStats {
 			stats.BytesReceived = connWithStats.BytesReceived()
 		}
 	}
+	stats.BytesSent += t.dtlsBytesSent.Load()
 
 	return stats
 }

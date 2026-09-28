@@ -22,6 +22,7 @@ import (
 	"github.com/pion/dtls/v4"
 	"github.com/pion/dtls/v4/pkg/crypto/fingerprint"
 	"github.com/pion/dtls/v4/pkg/protocol"
+	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
@@ -48,6 +49,7 @@ type DTLSTransport struct {
 	localCryptexMode      srtp.CryptexMode // outbound (send) Cryptex mode
 	remoteCryptexMode     srtp.CryptexMode // inbound (receive) Cryptex mode
 	negotiatedVersion     atomic.Uint32    // protocol.Version, 0 until the handshake completes
+	sped                  bool             // the handshake runs with SPED (DTLS in STUN)
 
 	onStateChangeHandler   func(DTLSTransportState)
 	internalOnCloseHandler func()
@@ -322,7 +324,7 @@ func (t *DTLSTransport) role() DTLSRole {
 	}
 
 	// If SettingEngine has an explicit role
-	switch t.api.settingEngine.answeringDTLSRole {
+	switch t.api.settingEngine.answeringRole(t.sped) {
 	case DTLSRoleServer:
 		return DTLSRoleServer
 	case DTLSRoleClient:
@@ -354,7 +356,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 		defer cancel()
 	}
 
-	return t.startPrepared(ctx, role, certificate)
+	return t.startPrepared(ctx, role, certificate, nil)
 }
 
 // StartContext starts DTLS transport negotiation with the parameters of the remote DTLS
@@ -366,10 +368,73 @@ func (t *DTLSTransport) StartContext(ctx context.Context, remoteParameters DTLSP
 		return err
 	}
 
-	return t.startPrepared(ctx, role, certificate)
+	return t.startPrepared(ctx, role, certificate, nil)
 }
 
-func (t *DTLSTransport) startPrepared(ctx context.Context, role DTLSRole, certificate tls.Certificate) error {
+// startWithSPED starts DTLS with SPED (DTLS in STUN), before the ICE transport:
+// it arms SPED on the ICE agent, starts DTLS so that a DTLS client's first
+// flight is queued for the first connectivity check, runs startICE, which
+// must start the ICE transport with iceRole, and waits for the handshake.
+func (t *DTLSTransport) startWithSPED(remoteParameters DTLSParameters, iceRole ICERole, startICE func() error) error {
+	if err := t.ensureICEConn(); err != nil {
+		return err
+	}
+	if err := t.iceTransport.enableSPED(iceRole, t.spedICEConnected); err != nil {
+		return err
+	}
+	t.lock.Lock()
+	t.sped = true
+	t.lock.Unlock()
+
+	role, certificate, err := t.prepareStart(remoteParameters)
+	if err != nil {
+		return err
+	}
+
+	ctx := context.Background()
+	var cancel func()
+	if contextMaker := t.api.settingEngine.dtls.connectContextMaker; contextMaker != nil {
+		ctx, cancel = contextMaker()
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
+	return t.startPrepared(ctx, role, certificate, startICE)
+}
+
+// spedICEConnected sets the DTLS retransmission timer from the ICE round-trip
+// time when ICE first connects, as libwebrtc's UpdateHandshakeTimeout does.
+// Until then SPED keeps DTLS retransmissions off.
+func (t *DTLSTransport) spedICEConnected() {
+	rtt, ok := t.iceTransport.selectedPairRTT()
+	if !ok {
+		rtt = spedDefaultRTT
+	}
+	interval := min(max(2*rtt, spedMinRetransmitInterval), spedMaxRetransmitInterval)
+
+	t.lock.RLock()
+	dtlsConn := t.dtlsConn
+	isClient := t.role() == DTLSRoleClient
+	t.lock.RUnlock()
+	if dtlsConn == nil {
+		return
+	}
+	if isClient && t.iceTransport.SPEDState() == ice.SPEDStateOff {
+		// The peer does not use SPED, so the pending flight is only sent now.
+		interval = interval * 133 / 100
+	}
+	if err := dtlsConn.SetRetransmitInterval(interval); err != nil {
+		t.log.Warnf("Failed to set the DTLS retransmission interval: %v", err)
+	}
+}
+
+func (t *DTLSTransport) startPrepared( //nolint:cyclop
+	ctx context.Context,
+	role DTLSRole,
+	certificate tls.Certificate,
+	startICE func() error,
+) error {
 	sharedOpts := t.dtlsSharedOptions(certificate)
 
 	dtlsConn, err := t.connectDTLS(role, sharedOpts)
@@ -378,7 +443,7 @@ func (t *DTLSTransport) startPrepared(ctx context.Context, role DTLSRole, certif
 	}
 
 	var conn *detacheddtls.Conn
-	conn = detacheddtls.New(detacheddtls.Config{
+	config := detacheddtls.Config{
 		DTLSConn:      dtlsConn,
 		WriteDatagram: t.iceTransport.write,
 		SetDatagramHandler: func(handler func([]byte) error) {
@@ -404,7 +469,15 @@ func (t *DTLSTransport) startPrepared(ctx context.Context, role DTLSRole, certif
 			SetWriteDeadline: t.iceTransport.setWriteDeadline,
 		},
 		OnClose: t.internalOnCloseHandler,
-	})
+	}
+	spedAgent := t.iceTransport.spedAgent.Load()
+	if t.sped {
+		config.WriteDatagram = t.iceTransport.writeDTLS
+		config.WriteFlight = t.iceTransport.writeDTLSFlight
+		config.OnHandshakeDone = spedAgent.SetDTLSHandshakeComplete
+		config.OnApplicationData = spedAgent.ApplicationDataReceived
+	}
+	conn = detacheddtls.New(config)
 	t.lock.Lock()
 	if t.state != DTLSTransportStateConnecting {
 		state := t.state
@@ -418,10 +491,18 @@ func (t *DTLSTransport) startPrepared(ctx context.Context, role DTLSRole, certif
 	t.conn = conn
 	t.lock.Unlock()
 
-	if err = conn.Start(ctx); err == nil {
+	if err = conn.Start(ctx); err == nil && startICE != nil {
+		if err = startICE(); err != nil {
+			conn.SetOnClose(nil)
+		}
+	}
+	if err == nil {
 		err = conn.Handshake()
 	}
 	if err != nil {
+		if t.sped {
+			spedAgent.SetDTLSFailed()
+		}
 		// A failed handshake closes the connection like a remote close would.
 		_ = conn.Close()
 		t.clearConn(conn)
@@ -484,12 +565,7 @@ func (t *DTLSTransport) dtlsSharedOptions(certificate tls.Certificate) []dtls.Op
 		)
 	}
 
-	if t.api.settingEngine.dtls.retransmissionInterval > 0 {
-		sharedOpts = append(
-			sharedOpts,
-			dtls.WithFlightInterval(t.api.settingEngine.dtls.retransmissionInterval),
-		)
-	}
+	sharedOpts = append(sharedOpts, t.flightOptions()...)
 
 	if t.api.settingEngine.replayProtection.DTLS != nil {
 		sharedOpts = append(
@@ -538,6 +614,23 @@ func (t *DTLSTransport) dtlsSharedOptions(certificate tls.Certificate) []dtls.Op
 	return sharedOpts
 }
 
+// flightOptions returns the options for the MTU and the retransmission of flights.
+func (t *DTLSTransport) flightOptions() []dtls.Option {
+	if t.sped {
+		// Flights ride the connectivity checks, which retransmit them; the timer is
+		// set from the ICE round-trip time once ICE connects (spedICEConnected).
+		return []dtls.Option{
+			dtls.WithFlightInterval(spedDisabledRetransmitInterval),
+			dtls.WithMTU(spedDTLSMTU),
+		}
+	}
+	if t.api.settingEngine.dtls.retransmissionInterval > 0 {
+		return []dtls.Option{dtls.WithFlightInterval(t.api.settingEngine.dtls.retransmissionInterval)}
+	}
+
+	return nil
+}
+
 func (t *DTLSTransport) srtpProtectionProfiles() []dtls.SRTPProtectionProfile {
 	if len(t.api.settingEngine.srtpProtectionProfiles) > 0 {
 		return t.api.settingEngine.srtpProtectionProfiles
@@ -574,6 +667,10 @@ func (t *DTLSTransport) connectDTLS(
 	sharedOpts []dtls.Option,
 ) (*dtls.DetachedConn, error) {
 	remoteAddr := t.iceTransport.remoteAddr()
+	if remoteAddr == nil {
+		// With SPED, DTLS starts before ICE has selected a pair.
+		remoteAddr = spedRemoteAddr{}
+	}
 	if role == DTLSRoleClient {
 		clientOpts := t.toDTLSClientOptions(sharedOpts)
 
@@ -599,7 +696,8 @@ func (t *DTLSTransport) toDTLSServerOptions(sharedOpts []dtls.Option) []dtls.Ser
 	serverOpts = append(serverOpts,
 		dtls.WithClientAuth(clientAuth),
 		dtls.WithClientCAs(t.api.settingEngine.dtls.clientCAs),
-		dtls.WithInsecureSkipVerifyHello(t.api.settingEngine.dtls.insecureSkipHelloVerify),
+		// With SPED, DTLS only arrives through ICE, whose checks prove the peer's address.
+		dtls.WithInsecureSkipVerifyHello(t.api.settingEngine.dtls.insecureSkipHelloVerify || t.sped),
 	)
 
 	if t.api.settingEngine.dtls.serverHelloMessageHook != nil {
