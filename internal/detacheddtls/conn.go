@@ -18,15 +18,31 @@ import (
 
 // Config contains the transport operations used by a Conn.
 type Config struct {
-	DTLSConn           *dtls.DetachedConn
-	WriteDatagram      func([]byte) (int, error)
+	DTLSConn *dtls.DetachedConn
+	// WriteDatagram writes the datagrams of application data written to the
+	// Conn, and every other datagram when WriteFlight is nil.
+	WriteDatagram func([]byte) (int, error)
+	// WriteFlight, if not nil, writes each batch of datagrams DTLS produces on
+	// its own: a handshake flight, a retransmission, an acknowledgement or an alert.
+	WriteFlight        func([][]byte) error
 	SetDatagramHandler func(func([]byte) error)
-	NetConn            netconn.Config
-	OnClose            func()
+	// OnHandshakeDone, if not nil, runs when the handshake completes, before
+	// Handshake returns.
+	OnHandshakeDone func()
+	// OnApplicationData, if not nil, runs for every application data record
+	// received.
+	OnApplicationData func()
+	NetConn           netconn.Config
+	OnClose           func()
 }
 
 // Conn pumps a DetachedConn and exposes only its plaintext application data as
 // net.Conn for SCTP.
+//
+// Every call that drives DTLS (Start, HandleDatagram, Write) processes the
+// events it causes before it returns, so a flight that answers a datagram has
+// been written when HandleDatagram returns. A goroutine processes the events
+// of DTLS timers.
 type Conn struct {
 	*netconn.Conn
 
@@ -38,27 +54,21 @@ type Conn struct {
 	closeErr  error
 	closed    chan struct{}
 
+	// handshakeDone receives the handshake result once, guarded by eventMu.
+	handshakeDone     chan error
+	handshakeNotified bool
+
 	onCloseMu sync.Mutex
 	onClose   func()
-}
-
-type handshakeNotifier struct {
-	done chan<- error
-}
-
-func (n *handshakeNotifier) notify(err error) {
-	if n.done != nil {
-		n.done <- err
-		n.done = nil
-	}
 }
 
 // New creates a detached DTLS application-data connection.
 func New(config Config) *Conn {
 	c := &Conn{
-		config:  config,
-		closed:  make(chan struct{}),
-		onClose: config.OnClose,
+		config:        config,
+		closed:        make(chan struct{}),
+		handshakeDone: make(chan error, 1),
+		onClose:       config.OnClose,
 	}
 	config.NetConn.Write = c.write
 	c.Conn = netconn.New(config.NetConn)
@@ -66,9 +76,10 @@ func New(config Config) *Conn {
 	return c
 }
 
-// Start starts DTLS, registers its inbound datagram handler, and processes
-// events until the handshake completes or fails. Event processing continues
-// after a successful handshake.
+// Start starts DTLS, registers its inbound datagram handler and writes its
+// first flight, if any. It returns once DTLS waits for the peer; Handshake
+// waits for the handshake to complete. Event processing continues after a
+// successful handshake.
 func (c *Conn) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -82,81 +93,106 @@ func (c *Conn) Start(ctx context.Context) error {
 	}
 
 	c.config.SetDatagramHandler(c.HandleDatagram)
-	handshakeDone := make(chan error, 1)
-	go c.processEvents(handshakeDone)
+	c.processReadyEvents(false)
+	go c.processEvents()
 
-	return <-handshakeDone
+	return nil
 }
 
-// HandleDatagram supplies one classified inbound DTLS datagram.
+// Handshake waits until the handshake started by Start completes or fails.
+func (c *Conn) Handshake() error {
+	return <-c.handshakeDone
+}
+
+// HandleDatagram supplies one classified inbound DTLS datagram and processes
+// the events it causes.
 func (c *Conn) HandleDatagram(datagram []byte) error {
 	c.driveMu.Lock()
-	defer c.driveMu.Unlock()
+	err := c.config.DTLSConn.HandleDatagram(datagram, c.RemoteAddr())
+	c.driveMu.Unlock()
+	c.processReadyEvents(false)
 
-	return c.config.DTLSConn.HandleDatagram(datagram, c.RemoteAddr())
+	return err
 }
 
-func (c *Conn) processEvents(handshakeDone chan<- error) {
-	notifier := handshakeNotifier{done: handshakeDone}
-
+func (c *Conn) processEvents() {
 	for {
 		select {
 		case <-c.closed:
-			notifier.notify(dtls.ErrConnClosed)
-
 			return
 		case <-c.config.DTLSConn.EventReady():
 		}
 
-		if c.processReadyEvents(&notifier) {
-			_ = c.close(false)
-
-			return
-		}
+		c.processReadyEvents(false)
 	}
 }
 
-func (c *Conn) processReadyEvents(notifier *handshakeNotifier) bool {
+// processReadyEvents processes the pending events. Their datagrams are written
+// as application data if userData is true.
+func (c *Conn) processReadyEvents(userData bool) {
 	c.eventMu.Lock()
-	defer c.eventMu.Unlock()
+	closed := c.processReadyEventsLocked(userData)
+	c.eventMu.Unlock()
 
+	if closed {
+		_ = c.close(false)
+	}
+}
+
+func (c *Conn) processReadyEventsLocked(userData bool) bool {
 	for {
 		event := c.config.DTLSConn.NextEvent()
 		if event.Kind == dtls.DetachedNoEvent {
 			return false
 		}
-		if c.processEvent(event, notifier) {
+		if c.processEvent(event, userData) {
 			return true
 		}
 	}
 }
 
-func (c *Conn) processEvent(event dtls.DetachedEvent, notifier *handshakeNotifier) bool {
+func (c *Conn) processEvent(event dtls.DetachedEvent, userData bool) bool {
 	var err error
 	switch event.Kind {
 	case dtls.DetachedNoEvent:
 		return false
 	case dtls.DetachedWriteDatagrams:
-		err = c.writeDatagrams(event.Datagrams)
+		err = c.writeDatagrams(event.Datagrams, userData)
 	case dtls.DetachedApplicationData:
+		if c.config.OnApplicationData != nil {
+			c.config.OnApplicationData()
+		}
 		err = c.Push(event.Data)
 	case dtls.DetachedHandshakeDone:
-		notifier.notify(nil)
+		if c.config.OnHandshakeDone != nil {
+			c.config.OnHandshakeDone()
+		}
+		c.notifyHandshakeLocked(nil)
 
 		return false
 	case dtls.DetachedClosed:
-		notifier.notify(event.Err)
+		c.notifyHandshakeLocked(event.Err)
 
 		return true
 	}
 	if err != nil {
-		notifier.notify(err)
+		c.notifyHandshakeLocked(err)
 	}
 
 	return err != nil
 }
 
-func (c *Conn) writeDatagrams(datagrams [][]byte) error {
+func (c *Conn) notifyHandshakeLocked(err error) {
+	if !c.handshakeNotified {
+		c.handshakeNotified = true
+		c.handshakeDone <- err
+	}
+}
+
+func (c *Conn) writeDatagrams(datagrams [][]byte, userData bool) error {
+	if !userData && c.config.WriteFlight != nil {
+		return c.config.WriteFlight(datagrams)
+	}
 	for _, datagram := range datagrams {
 		if _, err := c.config.WriteDatagram(datagram); err != nil {
 			return err
@@ -167,10 +203,18 @@ func (c *Conn) writeDatagrams(datagrams [][]byte) error {
 }
 
 func (c *Conn) write(p []byte) (int, error) {
+	c.eventMu.Lock()
 	c.driveMu.Lock()
-	defer c.driveMu.Unlock()
+	n, err := c.config.DTLSConn.Write(p)
+	c.driveMu.Unlock()
+	closed := c.processReadyEventsLocked(true)
+	c.eventMu.Unlock()
 
-	return c.config.DTLSConn.Write(p)
+	if closed {
+		_ = c.close(false)
+	}
+
+	return n, err
 }
 
 // Close closes the DTLS connection, flushing any final datagrams such as a
@@ -207,6 +251,9 @@ func (c *Conn) close(flushEvents bool) error {
 			onClose()
 		}
 		c.closeErr = util.FlattenErrs([]error{dtlsErr, flushErr, c.Conn.Close()})
+		c.eventMu.Lock()
+		c.notifyHandshakeLocked(dtls.ErrConnClosed)
+		c.eventMu.Unlock()
 		close(c.closed)
 	})
 

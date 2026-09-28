@@ -109,10 +109,10 @@ func TestConn(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			started := make(chan error, 1)
-			go func() { started <- server.Start(ctx) }()
+			require.NoError(t, server.Start(ctx))
 			require.NoError(t, client.Start(ctx))
-			require.NoError(t, <-started)
+			require.NoError(t, client.Handshake())
+			require.NoError(t, server.Handshake())
 
 			state, ok := client.config.DTLSConn.ConnectionState()
 			require.True(t, ok)
@@ -147,17 +147,13 @@ func TestConn_CloseTransportInterruptsHandshake(t *testing.T) {
 	conn, closed := newTestConn(t, end, true, protocol.Version1_3)
 	conn.SetOnClose(nil)
 
-	started := make(chan error, 1)
-	go func() { started <- conn.Start(context.Background()) }()
-	require.Eventually(t, func() bool {
-		end.mu.Lock()
-		defer end.mu.Unlock()
-
-		return end.handler != nil
-	}, 5*time.Second, time.Millisecond)
+	require.NoError(t, conn.Start(context.Background()))
+	end.mu.Lock()
+	assert.NotNil(t, end.handler)
+	end.mu.Unlock()
 
 	assert.NoError(t, conn.CloseTransport())
-	assert.Error(t, <-started)
+	assert.Error(t, conn.Handshake())
 	select {
 	case <-closed:
 		assert.Fail(t, "OnClose must not run after SetOnClose(nil)")
@@ -165,4 +161,116 @@ func TestConn_CloseTransportInterruptsHandshake(t *testing.T) {
 	}
 	// Close after CloseTransport is a no-op.
 	assert.NoError(t, conn.Close())
+}
+
+// TestConn_EventsProcessedByTheirCaller checks that the datagrams a call makes
+// DTLS produce are written before the call returns: a handshake flight through
+// WriteFlight, application data written to the Conn through WriteDatagram.
+func TestConn_EventsProcessedByTheirCaller(t *testing.T) {
+	lim := test.TimeOut(10 * time.Second)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	cert, err := selfsign.GenerateSelfSigned()
+	require.NoError(t, err)
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5000}
+	client, err := dtls.DetachedClient(addr, dtls.WithInsecureSkipVerify(true))
+	require.NoError(t, err)
+	server, err := dtls.DetachedServer(addr, dtls.WithCertificates(cert), dtls.WithInsecureSkipVerifyHello(true))
+	require.NoError(t, err)
+
+	type end struct {
+		conn                  *Conn
+		mu                    sync.Mutex
+		flights, applications [][]byte
+		handshakeDone         bool
+	}
+	newEnd := func(dtlsConn *dtls.DetachedConn) *end {
+		peer := &end{}
+		peer.conn = New(Config{
+			DTLSConn: dtlsConn,
+			WriteDatagram: func(datagram []byte) (int, error) {
+				peer.mu.Lock()
+				defer peer.mu.Unlock()
+				peer.applications = append(peer.applications, append([]byte(nil), datagram...))
+
+				return len(datagram), nil
+			},
+			WriteFlight: func(flight [][]byte) error {
+				peer.mu.Lock()
+				defer peer.mu.Unlock()
+				for _, datagram := range flight {
+					peer.flights = append(peer.flights, append([]byte(nil), datagram...))
+				}
+
+				return nil
+			},
+			SetDatagramHandler: func(func([]byte) error) {},
+			OnHandshakeDone: func() {
+				peer.mu.Lock()
+				defer peer.mu.Unlock()
+				peer.handshakeDone = true
+			},
+			NetConn: netconn.Config{
+				LocalAddr:        func() net.Addr { return addr },
+				RemoteAddr:       func() net.Addr { return addr },
+				SetWriteDeadline: func(time.Time) error { return nil },
+			},
+		})
+
+		return peer
+	}
+	clientEnd, serverEnd := newEnd(client), newEnd(server)
+	defer func() {
+		assert.NoError(t, clientEnd.conn.CloseTransport())
+		assert.NoError(t, serverEnd.conn.CloseTransport())
+	}()
+	// take returns and clears what e wrote, without waiting.
+	take := func(e *end) (flights, applications [][]byte) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		flights, applications = e.flights, e.applications
+		e.flights, e.applications = nil, nil
+
+		return flights, applications
+	}
+
+	ctx := context.Background()
+	require.NoError(t, serverEnd.conn.Start(ctx))
+	require.NoError(t, clientEnd.conn.Start(ctx))
+	for exchanged := 0; ; exchanged++ {
+		require.Less(t, exchanged, 10, "handshake did not complete")
+		clientFlights, _ := take(clientEnd)
+		for _, datagram := range clientFlights {
+			require.NoError(t, serverEnd.conn.HandleDatagram(datagram))
+		}
+		serverFlights, _ := take(serverEnd)
+		for _, datagram := range serverFlights {
+			require.NoError(t, clientEnd.conn.HandleDatagram(datagram))
+		}
+		if len(clientFlights) == 0 && len(serverFlights) == 0 {
+			break
+		}
+	}
+	require.NoError(t, clientEnd.conn.Handshake())
+	require.NoError(t, serverEnd.conn.Handshake())
+	for _, e := range []*end{clientEnd, serverEnd} {
+		e.mu.Lock()
+		assert.True(t, e.handshakeDone)
+		e.mu.Unlock()
+	}
+
+	_, err = clientEnd.conn.Write([]byte("hello"))
+	require.NoError(t, err)
+	flights, applications := take(clientEnd)
+	assert.Empty(t, flights)
+	require.Len(t, applications, 1)
+	require.NoError(t, serverEnd.conn.HandleDatagram(applications[0]))
+	buf := make([]byte, 16)
+	require.NoError(t, serverEnd.conn.SetReadDeadline(time.Now().Add(time.Second)))
+	n, err := serverEnd.conn.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(buf[:n]))
 }

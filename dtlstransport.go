@@ -418,7 +418,10 @@ func (t *DTLSTransport) startPrepared(ctx context.Context, role DTLSRole, certif
 	t.conn = conn
 	t.lock.Unlock()
 
-	if err = conn.Start(ctx); err != nil {
+	if err = conn.Start(ctx); err == nil {
+		err = conn.Handshake()
+	}
+	if err != nil {
 		// A failed handshake closes the connection like a remote close would.
 		_ = conn.Close()
 		t.clearConn(conn)
