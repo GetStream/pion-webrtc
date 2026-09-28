@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/datachannel"
@@ -74,6 +75,11 @@ type SCTPTransport struct {
 	dataChannelsAccepted  uint32
 
 	localSctpInit []byte
+
+	// snap is set once the association was started from the sctp-init tokens.
+	snap atomic.Bool
+	// negotiatedDataChannelOpened is set once a data channel with Negotiated: true opened.
+	negotiatedDataChannelOpened atomic.Bool
 
 	api *API
 	log logging.LeveledLogger
@@ -152,7 +158,8 @@ func (r *SCTPTransport) StartContext(ctx context.Context, capabilities SCTPCapab
 		return errSCTPTransportDTLS
 	}
 	opts := r.sctpClientOptions(dtlsTransport.conn, maxMessageSize)
-	if len(r.localSctpInit) > 0 && len(remoteSctpInit) > 0 {
+	snap := len(r.localSctpInit) > 0 && len(remoteSctpInit) > 0
+	if snap {
 		opts = append(
 			opts,
 			sctp.WithSNAP(r.localSctpInit, remoteSctpInit),
@@ -167,6 +174,7 @@ func (r *SCTPTransport) StartContext(ctx context.Context, capabilities SCTPCapab
 		return err
 	}
 
+	r.snap.Store(snap)
 	r.lock.Lock()
 	r.sctpAssociation = sctpAssociation
 	r.state = SCTPTransportStateConnected
