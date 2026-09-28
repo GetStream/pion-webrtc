@@ -8,12 +8,14 @@ package webrtc
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 	"github.com/pion/transport/v5/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -264,4 +266,64 @@ func TestICETransport_GetLocalAndRemoteParameters(t *testing.T) {
 	assert.Equal(t, answerLocalParameters.Password, offerRemoteParameters.Password)
 
 	closePairNow(t, offerer, answerer)
+}
+
+func TestICETransport_DispatchPacket(t *testing.T) {
+	iceTransport := NewICETransport(nil, logging.NewDefaultLoggerFactory())
+
+	dtls12Packet := []byte{22, 0xfe, 0xfd, 0}
+	dtls13Packet := []byte{0x2f, 1, 2, 3} // DTLS 1.3 unified header, epoch 3
+	rtpPacket := []byte{0x80, 96, 0, 1}
+	rtcpPacket := []byte{0x80, 200, 0, 1}
+
+	// Packets that arrive before their handler exists are queued.
+	for _, packet := range [][]byte{dtls12Packet, rtpPacket, dtls13Packet, rtcpPacket} {
+		iceTransport.dispatchPacket(packet)
+	}
+
+	var dtlsPackets [][]byte
+	dtlsClosed := 0
+	iceTransport.setDTLSHandler(func(packet []byte) error {
+		dtlsPackets = append(dtlsPackets, append([]byte(nil), packet...))
+
+		return nil
+	}, func() { dtlsClosed++ })
+	assert.Equal(t, [][]byte{dtls12Packet, dtls13Packet}, dtlsPackets)
+
+	srtpEndpoint := iceTransport.newEndpoint(iceEndpointSRTP)
+	srtcpEndpoint := iceTransport.newEndpoint(iceEndpointSRTCP)
+	buf := make([]byte, 16)
+	n, err := srtpEndpoint.Read(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, rtpPacket, buf[:n])
+	n, err = srtcpEndpoint.Read(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, rtcpPacket, buf[:n])
+
+	// Once a handler is set, packets go straight to it.
+	iceTransport.dispatchPacket(dtls13Packet)
+	assert.Len(t, dtlsPackets, 3)
+
+	// Stopping the transport closes the endpoints and tells DTLS once.
+	iceTransport.closeEndpoints()
+	iceTransport.closeEndpoints()
+	assert.Equal(t, 1, dtlsClosed)
+	_, err = srtpEndpoint.Read(buf)
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestICETransport_DispatchPacketPendingLimit(t *testing.T) {
+	iceTransport := NewICETransport(nil, logging.NewDefaultLoggerFactory())
+
+	for i := range maxPendingTransportPackets + 5 {
+		iceTransport.dispatchPacket([]byte{22, byte(i)})
+	}
+
+	received := 0
+	iceTransport.setDTLSHandler(func([]byte) error {
+		received++
+
+		return nil
+	}, nil)
+	assert.Equal(t, maxPendingTransportPackets, received)
 }
