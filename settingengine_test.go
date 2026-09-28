@@ -17,6 +17,7 @@ import (
 	"github.com/pion/dtls/v4"
 	dtlsCipherSuite "github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
 	"github.com/pion/dtls/v4/pkg/crypto/elliptic"
+	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/dtls/v4/pkg/protocol/handshake"
 	"github.com/pion/ice/v4"
 	"github.com/pion/stun/v4"
@@ -706,6 +707,34 @@ func TestSettingEngine_MediaEngineAndMTUFlags(t *testing.T) {
 
 	se.SetReceiveMTU(1337)
 	assert.Equal(t, uint(1337), se.receiveMTU)
+}
+
+func TestSetDTLSVersionRange(t *testing.T) {
+	s := SettingEngine{}
+	assert.Zero(t, s.dtls.minVersion, "DTLS 1.2 only unless configured")
+	assert.Zero(t, s.dtls.maxVersion, "DTLS 1.2 only unless configured")
+
+	for _, versions := range [][2]protocol.Version{
+		{protocol.Version1_2, protocol.Version1_2},
+		{protocol.Version1_2, protocol.Version1_3},
+		{protocol.Version1_3, protocol.Version1_3},
+	} {
+		assert.NoError(t, s.SetDTLSVersionRange(versions[0], versions[1]))
+		assert.Equal(t, versions[0], s.dtls.minVersion)
+		assert.Equal(t, versions[1], s.dtls.maxVersion)
+	}
+
+	s = SettingEngine{}
+	for _, versions := range [][2]protocol.Version{
+		{protocol.Version1_3, protocol.Version1_2},
+		{protocol.Version1_0, protocol.Version1_2},
+		{protocol.Version1_2, 0},
+		{0, 0},
+	} {
+		assert.ErrorIs(t, s.SetDTLSVersionRange(versions[0], versions[1]), errSettingEngineDTLSVersionRange)
+		assert.Zero(t, s.dtls.minVersion)
+		assert.Zero(t, s.dtls.maxVersion)
+	}
 }
 
 func TestSettingEngine_DTLSSetters(t *testing.T) {

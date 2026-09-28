@@ -20,6 +20,7 @@ import (
 	"github.com/pion/dtls/v4"
 	dtlsCipherSuite "github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
 	dtlsElliptic "github.com/pion/dtls/v4/pkg/crypto/elliptic"
+	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/dtls/v4/pkg/protocol/handshake"
 	"github.com/pion/srtp/v3"
 	"github.com/pion/transport/v5/test"
@@ -416,6 +417,13 @@ func TestDTLSTransport_dtlsSharedOptions_IncludesOptionalOptions(t *testing.T) {
 				se.dtls.supportedProtocols = []string{"webrtc", "c-webrtc"}
 			},
 			wantExtra: 1,
+		},
+		{
+			name: "VersionRange",
+			configure: func(se *SettingEngine) {
+				assert.NoError(t, se.SetDTLSVersionRange(protocol.Version1_2, protocol.Version1_3))
+			},
+			wantExtra: 2,
 		},
 	}
 

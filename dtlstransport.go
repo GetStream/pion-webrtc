@@ -21,6 +21,7 @@ import (
 
 	"github.com/pion/dtls/v4"
 	"github.com/pion/dtls/v4/pkg/crypto/fingerprint"
+	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
@@ -46,6 +47,7 @@ type DTLSTransport struct {
 	srtpProtectionProfile srtp.ProtectionProfile
 	localCryptexMode      srtp.CryptexMode // outbound (send) Cryptex mode
 	remoteCryptexMode     srtp.CryptexMode // inbound (receive) Cryptex mode
+	negotiatedVersion     atomic.Uint32    // protocol.Version, 0 until the handshake completes
 
 	onStateChangeHandler   func(DTLSTransportState)
 	internalOnCloseHandler func()
@@ -196,6 +198,15 @@ func (t *DTLSTransport) GetLocalParameters() (DTLSParameters, error) {
 		Role:         DTLSRoleAuto, // always returns the default role
 		Fingerprints: fingerprints,
 	}, nil
+}
+
+// NegotiatedVersion returns the DTLS version negotiated with the remote peer:
+// protocol.Version1_2 or protocol.Version1_3. It returns false until the
+// DTLS handshake has completed.
+func (t *DTLSTransport) NegotiatedVersion() (protocol.Version, bool) {
+	version := protocol.Version(t.negotiatedVersion.Load()) //nolint:gosec // G115, stored from a protocol.Version
+
+	return version, version != 0
 }
 
 // GetRemoteCertificate returns the certificate chain in use by the remote side
@@ -513,6 +524,14 @@ func (t *DTLSTransport) dtlsSharedOptions(certificate tls.Certificate) []dtls.Op
 		)
 	}
 
+	if t.api.settingEngine.dtls.minVersion != 0 {
+		sharedOpts = append(
+			sharedOpts,
+			dtls.WithMinVersion(t.api.settingEngine.dtls.minVersion),
+			dtls.WithMaxVersion(t.api.settingEngine.dtls.maxVersion),
+		)
+	}
+
 	return sharedOpts
 }
 
@@ -626,6 +645,9 @@ func (t *DTLSTransport) completeStart(dtlsConn *dtls.DetachedConn) error {
 	}
 
 	t.srtpProtectionProfile = srtpProtectionProfile
+	if connState, ok := dtlsConn.ConnectionState(); ok {
+		t.negotiatedVersion.Store(uint32(connState.NegotiatedVersion()))
+	}
 	t.onStateChange(DTLSTransportStateConnected)
 
 	return t.startSRTP()

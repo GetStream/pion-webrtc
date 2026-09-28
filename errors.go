@@ -289,6 +289,9 @@ var (
 	)
 
 	errSettingEngineSetAnsweringDTLSRole = errors.New("SetAnsweringDTLSRole must DTLSRoleClient or DTLSRoleServer")
+	errSettingEngineDTLSVersionRange     = errors.New(
+		"SetDTLSVersionRange needs DTLS 1.2 or 1.3 for both bounds and minVersion not above maxVersion",
+	)
 
 	errSignalingStateCannotRollback            = errors.New("can't rollback from stable state")
 	errSignalingStateProposedTransitionInvalid = errors.New("invalid proposed signaling state transition")

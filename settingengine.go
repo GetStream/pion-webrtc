@@ -16,6 +16,7 @@ import (
 	"github.com/pion/dtls/v4"
 	dtlsCipherSuite "github.com/pion/dtls/v4/pkg/crypto/ciphersuite"
 	dtlsElliptic "github.com/pion/dtls/v4/pkg/crypto/elliptic"
+	"github.com/pion/dtls/v4/pkg/protocol"
 	"github.com/pion/dtls/v4/pkg/protocol/handshake"
 	"github.com/pion/ice/v4"
 	"github.com/pion/logging"
@@ -84,6 +85,7 @@ type SettingEngine struct {
 		serverHelloMessageHook        func(handshake.MessageServerHello) handshake.Message
 		certificateRequestMessageHook func(handshake.MessageCertificateRequest) handshake.Message
 		supportedProtocols            []string
+		minVersion, maxVersion        protocol.Version
 	}
 	sctp struct {
 		maxReceiveBufferSize uint32
@@ -555,6 +557,35 @@ func (e *SettingEngine) SetDTLSRetransmissionInterval(interval time.Duration) {
 // but will have lower DoS attack resistance.
 func (e *SettingEngine) SetDTLSInsecureSkipHelloVerify(skip bool) {
 	e.dtls.insecureSkipHelloVerify = skip
+}
+
+// SetDTLSVersionRange sets the lowest and highest DTLS versions offered and accepted.
+// Only DTLS 1.2 is used by default. SetDTLSVersionRange(protocol.Version1_2, protocol.Version1_3)
+// enables DTLS 1.3 with DTLS 1.2 as fallback; the version is negotiated in the handshake.
+// As DTLS server, the DTLS 1.2 HelloVerifyRequest and the DTLS 1.3 cookie HelloRetryRequest
+// both follow SetDTLSInsecureSkipHelloVerify.
+func (e *SettingEngine) SetDTLSVersionRange(minVersion, maxVersion protocol.Version) error {
+	minRank, maxRank := dtlsVersionRank(minVersion), dtlsVersionRank(maxVersion)
+	if minRank == 0 || maxRank == 0 || minRank > maxRank {
+		return errSettingEngineDTLSVersionRange
+	}
+
+	e.dtls.minVersion = minVersion
+	e.dtls.maxVersion = maxVersion
+
+	return nil
+}
+
+// dtlsVersionRank orders the supported DTLS versions, whose wire values count down.
+func dtlsVersionRank(version protocol.Version) int {
+	switch version {
+	case protocol.Version1_2:
+		return 1
+	case protocol.Version1_3:
+		return 2
+	default:
+		return 0
+	}
 }
 
 // SetDTLSDisableInsecureSkipVerify sets the disable skip insecure verify flag for DTLS.
