@@ -21,7 +21,7 @@ import (
 // once the server has ACKed the client's final flight, one round trip after the client could
 // start sending application data (RFC 9147 Section 5.8). Set it to false once pion/dtls
 // completes the client handshake when the final flight is sent.
-const dtls13ClientWaitsForFinalACK = true
+const dtls13ClientWaitsForFinalACK = false
 
 // dtlsHandshakeTime records when a DTLS transport started its handshake and when it connected.
 type dtlsHandshakeTime struct {

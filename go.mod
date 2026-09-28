@@ -34,3 +34,9 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
+
+replace github.com/pion/dtls/v4 => github.com/GetStream/pion-dtls/v4 v4.0.0-rc.1-warp.1
+
+replace github.com/pion/ice/v4 => github.com/GetStream/pion-ice/v4 v4.4.4-warp.1
+
+replace github.com/pion/sctp => github.com/GetStream/pion-sctp v1.11.3-warp.1
