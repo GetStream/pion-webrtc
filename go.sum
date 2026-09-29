@@ -1,7 +1,7 @@
 github.com/GetStream/pion-dtls/v4 v4.0.0-rc.1-warp.1 h1:MpkUBXJU3E6JJ2SkxxxZtiFi3he11Dh1K6zKOz0yn/8=
 github.com/GetStream/pion-dtls/v4 v4.0.0-rc.1-warp.1/go.mod h1:P8msRRyK3bGwG3aZccN0Vk8chAMp2nQiBR9O29b86Io=
-github.com/GetStream/pion-ice/v4 v4.4.4-warp.1 h1:jrSF1QK2+MgKuauR/XiQj7ViMWfUvEttnInBCq9fBn4=
-github.com/GetStream/pion-ice/v4 v4.4.4-warp.1/go.mod h1:vkrbLwF98P/DJuCKoAmOQY4FJ7dJPI5VcBFOO3kyYx0=
+github.com/GetStream/pion-ice/v4 v4.4.4-warp.2 h1:JR3/SsZ+sSPke/blonAjIrEqaKQPuhkZhtqio02nf6E=
+github.com/GetStream/pion-ice/v4 v4.4.4-warp.2/go.mod h1:vkrbLwF98P/DJuCKoAmOQY4FJ7dJPI5VcBFOO3kyYx0=
 github.com/GetStream/pion-sctp v1.11.3-warp.1 h1:/PcOWTVe1jATCPIz32EP3XmKkYOUE7mfZ4BJhEVDmh4=
 github.com/GetStream/pion-sctp v1.11.3-warp.1/go.mod h1:7v/MXGBROc8fu9g2TVwCXRasPISCMd3j8wSH+o45uCI=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
