@@ -32,8 +32,13 @@ type Config struct {
 	// OnApplicationData, if not nil, runs for every application data record
 	// received.
 	OnApplicationData func()
-	NetConn           netconn.Config
-	OnClose           func()
+	// OnServerFinishedSent, if not nil, runs once when a DTLS 1.3 server has
+	// written the flight that ends with its Finished, before it processes any
+	// later datagram. It runs while events are processed, so it must not wait
+	// for anything that closes this Conn.
+	OnServerFinishedSent func()
+	NetConn              netconn.Config
+	OnClose              func()
 }
 
 // Conn pumps a DetachedConn and exposes only its plaintext application data as
@@ -151,7 +156,7 @@ func (c *Conn) processReadyEventsLocked(userData bool) bool {
 	}
 }
 
-func (c *Conn) processEvent(event dtls.DetachedEvent, userData bool) bool {
+func (c *Conn) processEvent(event dtls.DetachedEvent, userData bool) bool { //nolint:cyclop
 	var err error
 	switch event.Kind {
 	case dtls.DetachedNoEvent:
@@ -168,6 +173,12 @@ func (c *Conn) processEvent(event dtls.DetachedEvent, userData bool) bool {
 			c.config.OnHandshakeDone()
 		}
 		c.notifyHandshakeLocked(nil)
+
+		return false
+	case dtls.DetachedServerFinishedSent:
+		if c.config.OnServerFinishedSent != nil {
+			c.config.OnServerFinishedSent()
+		}
 
 		return false
 	case dtls.DetachedClosed:
