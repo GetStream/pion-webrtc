@@ -37,6 +37,6 @@ require (
 
 replace github.com/pion/dtls/v4 => github.com/GetStream/pion-dtls/v4 v4.0.0-rc.1-warp.1
 
-replace github.com/pion/ice/v4 => github.com/GetStream/pion-ice/v4 v4.4.4-warp.2
+replace github.com/pion/ice/v4 => github.com/GetStream/pion-ice/v4 v4.4.4-warp.3
 
 replace github.com/pion/sctp => github.com/GetStream/pion-sctp v1.11.3-warp.1
