@@ -64,6 +64,12 @@ type DTLSTransport struct {
 	srtpEndpoint, srtcpEndpoint *netconn.Conn
 	simulcastStreams            []simulcastStreamPair
 	srtpReady                   chan struct{}
+	srtpStarted                 bool
+
+	// earlySRTP is set for a DTLS server with early SRTP enabled, see
+	// SettingEngine.EnableDTLSServerEarlySRTP.
+	earlySRTP          atomic.Pointer[earlySRTP]
+	onEarlySRTPHandler func()
 
 	dtlsMatcher func([]byte) bool
 
@@ -223,8 +229,116 @@ func (t *DTLSTransport) GetRemoteCertificate() []byte {
 	return t.remoteCertificate
 }
 
+// OnEarlySRTP sets a handler that is fired when a DTLS server starts SRTP
+// before the handshake completes, see SettingEngine.EnableDTLSServerEarlySRTP.
+func (t *DTLSTransport) OnEarlySRTP(f func()) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.onEarlySRTPHandler = f
+}
+
+// EarlySRTPStats reports what the DTLS server did with early SRTP, see
+// SettingEngine.EnableDTLSServerEarlySRTP. It does not block.
+func (t *DTLSTransport) EarlySRTPStats() EarlySRTPStats {
+	if early := t.earlySRTP.Load(); early != nil {
+		return early.getStats()
+	}
+
+	return EarlySRTPStats{}
+}
+
+// serverFinishedSent runs once a DTLS 1.3 server has written its Finished,
+// while the DTLS connection processes the datagram that completed the
+// ClientHello. Stop holds the lock while it closes that connection, so SRTP
+// starts on another goroutine.
+func (t *DTLSTransport) serverFinishedSent(early *earlySRTP, sped bool, dtlsConn *dtls.DetachedConn) {
+	spedState := t.iceTransport.SPEDState()
+	switch {
+	case !sped || spedState == ice.SPEDStateOff:
+		early.setIneligible(EarlySRTPStateNoSPED)
+	case t.iceTransport.directDTLSReceived.Load() != 0:
+		// The ClientHello may have come from an on-path attacker, which can
+		// derive the keys if it substituted its own key share.
+		early.setIneligible(EarlySRTPStateDirectDTLS)
+	case spedState != ice.SPEDStateConfirmed:
+		early.setIneligible(EarlySRTPStateNoSPED)
+	default:
+		go t.startEarlySRTP(early, dtlsConn)
+	}
+}
+
+func (t *DTLSTransport) startEarlySRTP(early *earlySRTP, dtlsConn *dtls.DetachedConn) {
+	srtpProtectionProfile, err := srtpProtectionProfileFromDTLSConn(dtlsConn)
+	if err != nil {
+		// The handshake fails with the same error.
+		return
+	}
+
+	t.lock.Lock()
+	if t.state != DTLSTransportStateConnecting || t.dtlsConn != dtlsConn || !early.start(time.Now()) {
+		t.lock.Unlock()
+
+		return
+	}
+	t.srtpProtectionProfile = srtpProtectionProfile
+	t.iceTransport.earlySRTP.Store(early)
+	if err = t.startSRTP(); err != nil {
+		early.end(EarlySRTPStateFailed, time.Now())
+		t.lock.Unlock()
+		t.log.Warnf("Failed to start SRTP early: %v", err)
+
+		return
+	}
+	handler := t.onEarlySRTPHandler
+	t.lock.Unlock()
+
+	if handler != nil {
+		handler()
+	}
+}
+
+// endEarlySRTPLocked records that the handshake failed or the transport stopped
+// after SRTP started early, and closes the SRTP and SRTCP sessions. It requires
+// the caller holds the lock.
+func (t *DTLSTransport) endEarlySRTPLocked(state EarlySRTPState) {
+	early := t.earlySRTP.Load()
+	if early == nil || !early.end(state, time.Now()) {
+		return
+	}
+
+	// Streams the peer opened are only accepted once the handshake completes, and
+	// a session does not close while a new stream waits to be accepted.
+	if srtpSession, err := t.getSRTPSession(); err == nil {
+		go func() {
+			for {
+				stream, _, err := srtpSession.AcceptStream()
+				if err != nil {
+					return
+				}
+				_ = stream.Close()
+			}
+		}()
+		_ = srtpSession.Close()
+	}
+	if srtcpSession, err := t.getSRTCPSession(); err == nil {
+		go func() {
+			for {
+				stream, _, err := srtcpSession.AcceptStream()
+				if err != nil {
+					return
+				}
+				_ = stream.Close()
+			}
+		}()
+		_ = srtcpSession.Close()
+	}
+}
+
 // startSRTP requires the caller holds the lock.
 func (t *DTLSTransport) startSRTP() error { //nolint:cyclop
+	if t.srtpStarted {
+		return nil
+	}
 	srtpConfig := &srtp.Config{
 		Profile:       t.srtpProtectionProfile,
 		BufferFactory: t.api.settingEngine.BufferFactory,
@@ -295,6 +409,7 @@ func (t *DTLSTransport) startSRTP() error { //nolint:cyclop
 
 	t.srtpSession.Store(srtpSession)
 	t.srtcpSession.Store(srtcpSession)
+	t.srtpStarted = true
 	close(t.srtpReady)
 
 	return nil
@@ -480,6 +595,12 @@ func (t *DTLSTransport) startPrepared( //nolint:cyclop
 		config.OnHandshakeDone = spedAgent.SetDTLSHandshakeComplete
 		config.OnApplicationData = spedAgent.ApplicationDataReceived
 	}
+	var early *earlySRTP
+	if window := t.api.settingEngine.dtls.earlySRTPWindow; window > 0 && role == DTLSRoleServer {
+		early = newEarlySRTP(window)
+		sped := t.sped
+		config.OnServerFinishedSent = func() { t.serverFinishedSent(early, sped, dtlsConn) }
+	}
 	conn = detacheddtls.New(config)
 	t.lock.Lock()
 	if t.state != DTLSTransportStateConnecting {
@@ -492,6 +613,9 @@ func (t *DTLSTransport) startPrepared( //nolint:cyclop
 	}
 	t.dtlsConn = dtlsConn
 	t.conn = conn
+	if early != nil {
+		t.earlySRTP.Store(early)
+	}
 	t.lock.Unlock()
 
 	if err = conn.Start(ctx); err == nil && startICE != nil {
@@ -503,6 +627,9 @@ func (t *DTLSTransport) startPrepared( //nolint:cyclop
 		err = conn.Handshake()
 	}
 	if err != nil {
+		t.lock.Lock()
+		t.endEarlySRTPLocked(EarlySRTPStateFailed)
+		t.lock.Unlock()
 		if t.sped {
 			spedAgent.SetDTLSFailed()
 		}
@@ -744,6 +871,7 @@ func (t *DTLSTransport) completeStart(dtlsConn *dtls.DetachedConn) error {
 	defer t.lock.Unlock()
 
 	if err != nil {
+		t.endEarlySRTPLocked(EarlySRTPStateFailed)
 		t.onStateChange(DTLSTransportStateFailed)
 
 		return err
@@ -752,6 +880,13 @@ func (t *DTLSTransport) completeStart(dtlsConn *dtls.DetachedConn) error {
 	t.srtpProtectionProfile = srtpProtectionProfile
 	if connState, ok := dtlsConn.ConnectionState(); ok {
 		t.negotiatedVersion.Store(uint32(connState.NegotiatedVersion()))
+	}
+	if early := t.earlySRTP.Load(); early != nil {
+		if version, _ := t.NegotiatedVersion(); version == protocol.Version1_2 {
+			early.setIneligible(EarlySRTPStateDTLS12)
+		}
+		early.end(EarlySRTPStateVerified, time.Now())
+		t.iceTransport.earlySRTP.Store(nil)
 	}
 	t.onStateChange(DTLSTransportStateConnected)
 
@@ -770,6 +905,7 @@ func (t *DTLSTransport) clearConn(conn *detacheddtls.Conn) {
 func (t *DTLSTransport) failStart(err error) error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
+	t.endEarlySRTPLocked(EarlySRTPStateFailed)
 	t.onStateChange(DTLSTransportStateFailed)
 
 	return err
@@ -807,6 +943,7 @@ func (t *DTLSTransport) Stop() error {
 	// Try closing everything and collect the errors
 	var closeErrs []error
 
+	t.endEarlySRTPLocked(EarlySRTPStateClosed)
 	if srtpSession, err := t.getSRTPSession(); err == nil && srtpSession != nil {
 		closeErrs = append(closeErrs, srtpSession.Close())
 	}

@@ -61,6 +61,12 @@ type ICETransport struct {
 	// dtlsBytesSent counts the DTLS datagrams written with ice.Agent.WriteDTLS,
 	// which ice.Conn.BytesSent does not count.
 	dtlsBytesSent atomic.Uint64
+	// bytesReceived counts the DTLS, SRTP and SRTCP bytes received, directly or
+	// inside STUN, and directDTLSReceived the DTLS datagrams received directly.
+	bytesReceived      atomic.Uint64
+	directDTLSReceived atomic.Uint64
+	// earlySRTP, while set, decides which SRTP and SRTCP writes are sent.
+	earlySRTP atomic.Pointer[earlySRTP]
 
 	ctxCancel func()
 
@@ -441,7 +447,7 @@ func (t *ICETransport) setState(i ICETransportState) {
 
 func (t *ICETransport) newEndpoint(kind iceEndpointKind) *netconn.Conn {
 	endpoint := netconn.New(netconn.Config{
-		Write:            t.write,
+		Write:            t.writeMedia,
 		LocalAddr:        t.localAddr,
 		RemoteAddr:       t.remoteAddr,
 		SetWriteDeadline: t.setWriteDeadline,
@@ -527,11 +533,13 @@ func (t *ICETransport) dispatchPacket(packet []byte) {
 	}
 
 	t.reportToSPED(packet)
+	t.bytesReceived.Add(uint64(len(packet)))
 
 	t.packetLock.Lock()
 	var handler func([]byte) error
 	switch {
 	case matchDTLS(packet):
+		t.directDTLSReceived.Add(1)
 		handler = t.dtlsHandler
 	case matchSRTP(packet):
 		if endpoint := t.endpoints[iceEndpointSRTP]; endpoint != nil {
@@ -622,6 +630,15 @@ func (t *ICETransport) write(packet []byte) (int, error) {
 	return n, err
 }
 
+// writeMedia writes an SRTP or SRTCP packet, unless early SRTP drops it.
+func (t *ICETransport) writeMedia(packet []byte) (int, error) {
+	if early := t.earlySRTP.Load(); early != nil && !early.allow(len(packet), t.bytesReceived.Load()) {
+		return 0, nil
+	}
+
+	return t.write(packet)
+}
+
 // enableSPED enables SPED (DTLS in STUN) on the ICE agent. It must be called
 // before Start, with the role Start will get, which the DTLS role depends on:
 // the agent then carries SPED attributes from its first check, and Start
@@ -678,6 +695,7 @@ func (t *ICETransport) SPEDState() ice.SPEDState {
 // embedded in STUN, before the Binding response is built. The DTLS handler
 // processes it synchronously, so a flight it produces rides the response.
 func (t *ICETransport) handleEmbeddedDTLS(packet []byte, _ net.Addr) {
+	t.bytesReceived.Add(uint64(len(packet)))
 	t.packetLock.Lock()
 	handler := t.dtlsHandler
 	t.packetLock.Unlock()

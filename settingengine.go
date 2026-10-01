@@ -86,6 +86,7 @@ type SettingEngine struct {
 		certificateRequestMessageHook func(handshake.MessageCertificateRequest) handshake.Message
 		supportedProtocols            []string
 		minVersion, maxVersion        protocol.Version
+		earlySRTPWindow               time.Duration
 	}
 	sctp struct {
 		maxReceiveBufferSize uint32
@@ -605,6 +606,30 @@ func (e *SettingEngine) SetDTLSInsecureSkipHelloVerify(skip bool) {
 // answers to offers with SPED.
 func (e *SettingEngine) EnableSped(enable bool) {
 	e.sped.enabled = enable
+}
+
+// EnableDTLSServerEarlySRTP lets a DTLS server start SRTP right after it sends its
+// Finished, half a round trip before the client's Finished authenticates the client.
+// The SRTP keys are final at that point (RFC 8446 Section 7.1), and only the holder of
+// the key share in the ClientHello can derive them. A window of 0 turns it off, which
+// is the default.
+//
+// SRTP starts early only with DTLS 1.3 and SPED, and only if every DTLS datagram
+// received before the server's Finished arrived inside a STUN Binding request, which
+// MESSAGE-INTEGRITY authenticates with the local ICE password. Otherwise SRTP starts
+// when the handshake completes, as without this setting.
+//
+// Until the handshake completes, SRTP and SRTCP writes are dropped once they exceed
+// three times the bytes received on the ICE transport, and all of them are dropped
+// once window has elapsed since SRTP started. The peer certificate is verified as
+// usual, at the client's Finished. If the handshake fails, the SRTP and SRTCP
+// sessions are closed before the DTLSTransport becomes failed.
+//
+// The application decides what it sends before the peer is verified:
+// DTLSTransport.OnEarlySRTP reports when early SRTP starts, and
+// DTLSTransport.EarlySRTPStats reports what happened.
+func (e *SettingEngine) EnableDTLSServerEarlySRTP(window time.Duration) {
+	e.dtls.earlySRTPWindow = max(window, 0)
 }
 
 // SetDTLSVersionRange sets the lowest and highest DTLS versions offered and accepted.

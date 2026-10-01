@@ -30,6 +30,10 @@ type WARPState struct {
 	// NegotiatedDataChannel is true once a data channel created with
 	// Negotiated: true has opened. Such a channel needs no DCEP exchange.
 	NegotiatedDataChannel bool
+
+	// EarlySRTP reports what the DTLS server did with early SRTP, see
+	// SettingEngine.EnableDTLSServerEarlySRTP.
+	EarlySRTP EarlySRTPStats
 }
 
 // WARPState returns what the PeerConnection has negotiated so far. It does not
@@ -39,6 +43,7 @@ func (pc *PeerConnection) WARPState() WARPState {
 		SPED:                  pc.iceTransport.SPEDState(),
 		SNAP:                  pc.sctpTransport.snap.Load(),
 		NegotiatedDataChannel: pc.sctpTransport.negotiatedDataChannelOpened.Load(),
+		EarlySRTP:             pc.dtlsTransport.EarlySRTPStats(),
 	}
 	state.DTLSVersion, _ = pc.dtlsTransport.NegotiatedVersion()
 

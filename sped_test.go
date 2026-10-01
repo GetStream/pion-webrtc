@@ -38,6 +38,8 @@ type spedPeer struct {
 	// curves are passed to SetDTLSEllipticCurves. Without X25519MLKEM768 a
 	// DTLS 1.3 ClientHello fits in one datagram.
 	curves []elliptic.Curve
+	// earlySRTPWindow is passed to EnableDTLSServerEarlySRTP.
+	earlySRTPWindow time.Duration
 }
 
 var classicalCurves = []elliptic.Curve{elliptic.X25519, elliptic.P256} //nolint:gochecknoglobals
@@ -178,8 +180,10 @@ type spedEnd struct {
 	pc *PeerConnection
 	ip string
 
-	mu                          sync.Mutex
-	iceConnected, dtlsConnected time.Time
+	mu                                      sync.Mutex
+	iceConnected, dtlsConnected, dtlsFailed time.Time
+	// earlySRTP is what EarlySRTPStats returned in the Connected state callback.
+	earlySRTP EarlySRTPStats
 }
 
 func (e *spedEnd) track() {
@@ -193,11 +197,15 @@ func (e *spedEnd) track() {
 		}
 	})
 	e.pc.SCTP().Transport().OnStateChange(func(state DTLSTransportState) {
-		if state == DTLSTransportStateConnected {
-			e.mu.Lock()
+		e.mu.Lock()
+		switch state { //nolint:exhaustive
+		case DTLSTransportStateConnected:
 			e.dtlsConnected = time.Now()
-			e.mu.Unlock()
+			e.earlySRTP = e.pc.SCTP().Transport().EarlySRTPStats()
+		case DTLSTransportStateFailed:
+			e.dtlsFailed = time.Now()
 		}
+		e.mu.Unlock()
 	})
 }
 
@@ -206,6 +214,20 @@ func (e *spedEnd) times() (iceConnected, dtlsConnected time.Time) {
 	defer e.mu.Unlock()
 
 	return e.iceConnected, e.dtlsConnected
+}
+
+func (e *spedEnd) earlySRTPAtConnected() EarlySRTPStats {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.earlySRTP
+}
+
+func (e *spedEnd) failedAt() time.Time {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.dtlsFailed
 }
 
 func (e *spedEnd) spedState() ice.SPEDState {
@@ -256,6 +278,7 @@ func newSPEDPair(t *testing.T, oneWayDelay time.Duration, offer, answer spedPeer
 		if len(peer.curves) > 0 {
 			settings.SetDTLSEllipticCurves(peer.curves...)
 		}
+		settings.EnableDTLSServerEarlySRTP(peer.earlySRTPWindow)
 		pc, pcErr := NewAPI(WithSettingEngine(settings)).NewPeerConnection(Configuration{})
 		require.NoError(t, pcErr)
 		end := &spedEnd{pc: pc, ip: ip}
