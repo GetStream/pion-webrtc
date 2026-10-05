@@ -726,19 +726,13 @@ func TestSPED_HandshakeRoundTrips(t *testing.T) {
 		// want is when the DTLS client connects with SPED, in round trips after
 		// the offerer's first check.
 		want float64
-		// minSaving is how much earlier, in round trips, the DTLS client connects
-		// with SPED than without; 0 means at least 0.75.
-		minSaving float64
 	}{
 		// The SFU's publisher PeerConnection: a lite answerer that is the DTLS server.
 		{name: "DTLS12_LiteServer", lite: true, want: 2},
 		{name: "DTLS13_LiteServer", dtls13: true, curves: classicalCurves, lite: true, want: 1},
 		// The post-quantum ClientHello takes two datagrams. The first rides the
 		// first check, the second goes out directly once the check is answered.
-		// The offerer nominates on that first check of a lite peer, so without
-		// SPED the ClientHello also leaves after one round trip: SPED saves
-		// nothing here.
-		{name: "DTLS13_PostQuantum_LiteServer", dtls13: true, lite: true, want: 2, minSaving: -0.25},
+		{name: "DTLS13_PostQuantum_LiteServer", dtls13: true, lite: true, want: 2},
 		// Default roles: the full answerer is the DTLS client. Its ClientHello
 		// rides the response to the offerer's first check.
 		{name: "DTLS12_Full", want: 2},
@@ -770,11 +764,7 @@ func TestSPED_HandshakeRoundTrips(t *testing.T) {
 			t.Logf("DTLS client connected %.2f RTT after the first check with SPED, %.2f without", with, without)
 
 			assert.Less(t, with, tc.want+0.5, "SPED handshake slower than %.1f RTT", tc.want)
-			minSaving := tc.minSaving
-			if minSaving == 0 {
-				minSaving = 0.75
-			}
-			assert.GreaterOrEqual(t, without-with, minSaving, "SPED saved less than %.2f RTT", minSaving)
+			assert.GreaterOrEqual(t, without-with, 0.75, "SPED saved less than a round trip")
 		})
 	}
 }
