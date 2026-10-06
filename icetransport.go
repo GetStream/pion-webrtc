@@ -632,11 +632,21 @@ func (t *ICETransport) write(packet []byte) (int, error) {
 
 // writeMedia writes an SRTP or SRTCP packet, unless early SRTP drops it.
 func (t *ICETransport) writeMedia(packet []byte) (int, error) {
-	if early := t.earlySRTP.Load(); early != nil && !early.allow(len(packet), t.bytesReceived.Load()) {
+	early := t.earlySRTP.Load()
+	if early == nil {
+		return t.write(packet)
+	}
+	ok, charged := early.allow(len(packet), t.bytesReceived.Load())
+	if !ok {
 		return 0, nil
 	}
+	n, err := t.write(packet)
+	if charged && n == 0 && err == nil {
+		// write reports no candidate pair as 0, nil: the packet did not leave.
+		early.refund(len(packet))
+	}
 
-	return t.write(packet)
+	return n, err
 }
 
 // enableSPED enables SPED (DTLS in STUN) on the ICE agent. It must be called

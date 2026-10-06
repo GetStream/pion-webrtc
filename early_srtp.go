@@ -134,32 +134,42 @@ func (e *earlySRTP) end(state EarlySRTPState, now time.Time) bool {
 }
 
 // allow reports whether to send an SRTP or SRTCP packet of n bytes, given the
-// bytes received so far, and counts it.
-func (e *earlySRTP) allow(n int, received uint64) bool {
+// bytes received so far, and counts it. charged reports whether the packet was
+// counted against the budget, so that refund can return it if it is not sent.
+func (e *earlySRTP) allow(n int, received uint64) (ok, charged bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	switch e.stats.State { //nolint:exhaustive
 	case EarlySRTPStateVerified:
-		return true
+		return true, false
 	case EarlySRTPStateStarted:
 	default:
-		return false
+		return false, false
 	}
 	if !time.Now().Before(e.deadline) {
 		e.stats.PacketsAfterWindow++
 
-		return false
+		return false, false
 	}
 	size := uint64(n) //nolint:gosec // G115, n is never negative
 	if e.stats.BytesSent+size > earlySRTPBudgetFactor*received {
 		e.stats.PacketsOverBudget++
 
-		return false
+		return false, false
 	}
 	e.stats.BytesSent += size
 	e.stats.PacketsSent++
 
-	return true
+	return true, true
+}
+
+// refund returns a charged packet of n bytes that could not be sent, for example
+// because the ICE-lite agent has no pair before it is nominated.
+func (e *earlySRTP) refund(n int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.stats.BytesSent -= uint64(n) //nolint:gosec // G115, n is never negative
+	e.stats.PacketsSent--
 }
 
 func (e *earlySRTP) getStats() EarlySRTPStats {

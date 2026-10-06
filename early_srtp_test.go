@@ -112,6 +112,27 @@ func (r *earlySRTPRun) waitFirstRTP(t *testing.T) time.Time {
 	}
 }
 
+// holdClientFinalFlight drops the client's final flight for hold after its first copy.
+func (r *earlySRTPRun) holdClientFinalFlight(hold time.Duration) {
+	var mu sync.Mutex
+	var firstDrop time.Time
+	r.wire.setDrop(func(packet wirePacket) bool {
+		datagram := packet.dtls()
+		// The client's final flight is its only data in the handshake epoch (2),
+		// which DTLS 1.3 sends with a unified header.
+		if packet.from != r.answer.ip || len(datagram) == 0 || datagram[0]&0xe3 != 0x22 {
+			return false
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if firstDrop.IsZero() {
+			firstDrop = packet.sent
+		}
+
+		return packet.sent.Sub(firstDrop) < hold
+	})
+}
+
 // serverMedia returns the SRTP and SRTCP packets the offerer sent.
 func (r *earlySRTPRun) serverMedia() []wirePacket {
 	var media []wirePacket
@@ -122,24 +143,6 @@ func (r *earlySRTPRun) serverMedia() []wirePacket {
 	}
 
 	return media
-}
-
-// clientBytesBefore returns the DTLS, SRTP and SRTCP bytes, in STUN or not,
-// that reached the offerer before at.
-func (r *earlySRTPRun) clientBytesBefore(at time.Time) int {
-	received := 0
-	for _, packet := range r.wire.delivered() {
-		if packet.from != r.answer.ip || !packet.sent.Add(earlySRTPOneWayDelay).Before(at) {
-			continue
-		}
-		if data := packet.embedded(); data != nil {
-			received += len(data)
-		} else if packet.stun == nil {
-			received += len(packet.raw)
-		}
-	}
-
-	return received
 }
 
 // requireNoMediaBefore checks that the offerer sent no SRTP or SRTCP before at.
@@ -168,8 +171,10 @@ func withWrongFingerprint(desc string) string {
 }
 
 // TestEarlySRTP_StartsAtServerFinished checks that a DTLS server with early SRTP
-// sends media from its Finished, so that the client reads it as soon as it is
-// connected instead of a round trip later.
+// starts it at its Finished. The client nominates only once a check has
+// succeeded, so the ICE-lite server has no pair to send on until the
+// nomination arrives, together with the client's Finished: against a client
+// that does not nominate in its first check, early SRTP saves nothing.
 func TestEarlySRTP_StartsAtServerFinished(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -213,16 +218,16 @@ func TestEarlySRTP_StartsAtServerFinished(t *testing.T) {
 
 			assert.Equal(t, EarlySRTPStateVerified, stats.State)
 			assert.Equal(t, EarlySRTPStateVerified, run.offer.earlySRTPAtConnected().State)
-			assert.Positive(t, stats.PacketsSent)
 			assert.Zero(t, stats.PacketsAfterWindow)
 			// SRTP started with the server's Finished, a round trip before the
 			// client's Finished reached the server.
 			assert.GreaterOrEqual(t, serverConnected.Sub(stats.StartedAt), run.rtt*3/4)
 			assert.False(t, stats.EndedAt.Before(stats.StartedAt))
+			// No media left before the nomination, which arrives with the client's Finished.
 			media := run.serverMedia()
 			require.NotEmpty(t, media)
-			assert.True(t, media[0].sent.Before(serverConnected.Add(-run.rtt/2)))
-			assert.Less(t, firstRTP.Sub(clientConnected), run.rtt/4)
+			assert.False(t, media[0].sent.Before(serverConnected.Add(-run.rtt/4)))
+			assert.GreaterOrEqual(t, firstRTP.Sub(clientConnected), run.rtt*3/4)
 		})
 	}
 }
@@ -303,40 +308,10 @@ func TestEarlySRTP_Ineligible(t *testing.T) {
 	}
 }
 
-// TestEarlySRTP_Budget checks that the media sent before the client's Finished
-// stays within three times the bytes received.
-func TestEarlySRTP_Budget(t *testing.T) {
-	lim := test.TimeOut(30 * time.Second)
-	defer lim.Stop()
-
-	run := newEarlySRTPRun(t, earlySRTPServer(2*time.Second), earlySRTPClient(), 200, time.Millisecond)
-	run.connect(t)
-	run.waitFirstRTP(t)
-
-	stats := run.offer.pc.WARPState().EarlySRTP
-	t.Logf("%+v", stats)
-	assert.Equal(t, EarlySRTPStateVerified, stats.State)
-	assert.Positive(t, stats.PacketsSent)
-	assert.Positive(t, stats.PacketsOverBudget)
-	_, serverConnected := run.offer.times()
-	assert.False(t, stats.EndedAt.After(serverConnected), "verified after the state change")
-
-	early := 0
-	for _, packet := range run.serverMedia() {
-		if packet.sent.Before(serverConnected.Add(-2 * time.Millisecond)) {
-			early += len(packet.raw)
-		}
-	}
-	received := run.clientBytesBefore(serverConnected)
-	t.Logf("%d bytes of media sent early for %d bytes received", early, received)
-	assert.Positive(t, early)
-	assert.LessOrEqual(t, early, earlySRTPBudgetFactor*received)
-	assert.LessOrEqual(t, uint64(early), stats.BytesSent) //nolint:gosec // G115
-}
-
 // TestEarlySRTP_Window holds back the client's final flight for longer than
-// the window, and checks that media pauses at the end of the window and
-// resumes when the handshake completes.
+// the window, and checks that the window expires and media flows when the
+// handshake completes. The final flight rides in the nominating check, so the
+// server has no pair to send early media on.
 func TestEarlySRTP_Window(t *testing.T) {
 	lim := test.TimeOut(30 * time.Second)
 	defer lim.Stop()
@@ -346,39 +321,19 @@ func TestEarlySRTP_Window(t *testing.T) {
 		hold   = 600 * time.Millisecond
 	)
 	run := newEarlySRTPRun(t, earlySRTPServer(window), earlySRTPClient(), 20, 10*time.Millisecond)
-	var mu sync.Mutex
-	var firstDrop time.Time
-	run.wire.setDrop(func(packet wirePacket) bool {
-		datagram := packet.dtls()
-		// The client's final flight is its only data in the handshake epoch (2),
-		// which DTLS 1.3 sends with a unified header.
-		if packet.from != run.answer.ip || len(datagram) == 0 || datagram[0]&0xe3 != 0x22 {
-			return false
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if firstDrop.IsZero() {
-			firstDrop = packet.sent
-		}
-
-		return packet.sent.Sub(firstDrop) < hold
-	})
+	run.holdClientFinalFlight(hold)
 	run.connect(t)
 	run.waitFirstRTP(t)
 
 	stats := run.offer.pc.WARPState().EarlySRTP
 	t.Logf("%+v", stats)
 	assert.Equal(t, EarlySRTPStateVerified, stats.State)
-	assert.Positive(t, stats.PacketsSent)
+	assert.Zero(t, stats.PacketsSent)
 	assert.Positive(t, stats.PacketsAfterWindow)
 
 	_, serverConnected := run.offer.times()
 	require.GreaterOrEqual(t, serverConnected.Sub(stats.StartedAt), hold)
-	for _, packet := range run.serverMedia() {
-		if packet.sent.Before(serverConnected.Add(-2 * time.Millisecond)) {
-			assert.Less(t, packet.sent.Sub(stats.StartedAt), window+10*time.Millisecond)
-		}
-	}
+	run.requireNoMediaBefore(t, serverConnected.Add(-2*time.Millisecond))
 }
 
 // TestEarlySRTP_FailedHandshake checks that a server that started SRTP early
@@ -401,7 +356,8 @@ func TestEarlySRTP_FailedHandshake(t *testing.T) {
 	stats := transport.EarlySRTPStats()
 	t.Logf("%+v", stats)
 	require.Equal(t, EarlySRTPStateFailed, stats.State)
-	assert.Positive(t, stats.PacketsSent)
+	// The client's final flight rides in the nominating check, so nothing left before it failed.
+	assert.Zero(t, stats.PacketsSent)
 	assert.False(t, stats.EndedAt.After(run.offer.failedAt()), "SRTP closed after the transport failed")
 
 	// The track keeps writing.
@@ -422,15 +378,27 @@ func TestEarlySRTP_FailedHandshake(t *testing.T) {
 }
 
 func TestEarlySRTP_Gate(t *testing.T) {
+	allowed := func(e *earlySRTP, n int, received uint64) bool {
+		ok, _ := e.allow(n, received)
+
+		return ok
+	}
 	early := newEarlySRTP(time.Hour)
-	assert.False(t, early.allow(10, 100), "before start")
+	assert.False(t, allowed(early, 10, 100), "before start")
 	require.True(t, early.start(time.Now()))
 	assert.False(t, early.start(time.Now()))
-	assert.True(t, early.allow(300, 100))
-	assert.False(t, early.allow(1, 100))
-	assert.True(t, early.allow(1, 101))
+	assert.True(t, allowed(early, 300, 100))
+	assert.False(t, allowed(early, 1, 100))
+	ok, charged := early.allow(1, 101)
+	assert.True(t, ok)
+	assert.True(t, charged)
+	// A packet that could not be sent gives its budget back.
+	early.refund(1)
+	assert.True(t, allowed(early, 1, 101))
 	require.True(t, early.end(EarlySRTPStateVerified, time.Now()))
-	assert.True(t, early.allow(1000, 0))
+	ok, charged = early.allow(1000, 0)
+	assert.True(t, ok)
+	assert.False(t, charged, "verified packets are not counted")
 	stats := early.getStats()
 	assert.Equal(t, uint64(2), stats.PacketsSent)
 	assert.Equal(t, uint64(301), stats.BytesSent)
@@ -438,13 +406,13 @@ func TestEarlySRTP_Gate(t *testing.T) {
 
 	expired := newEarlySRTP(time.Nanosecond)
 	require.True(t, expired.start(time.Now().Add(-time.Second)))
-	assert.False(t, expired.allow(1, 100))
+	assert.False(t, allowed(expired, 1, 100))
 	assert.Equal(t, uint64(1), expired.getStats().PacketsAfterWindow)
 
 	failed := newEarlySRTP(time.Hour)
 	require.True(t, failed.start(time.Now()))
 	require.True(t, failed.end(EarlySRTPStateFailed, time.Now()))
-	assert.False(t, failed.allow(1, 100))
+	assert.False(t, allowed(failed, 1, 100))
 	assert.False(t, failed.end(EarlySRTPStateVerified, time.Now()))
 
 	ineligible := newEarlySRTP(time.Hour)
